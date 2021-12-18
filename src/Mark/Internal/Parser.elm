@@ -1,22 +1,20 @@
 module Mark.Internal.Parser exposing
-    ( PreviouslyAdded(..)
-    , RecordType(..)
+    ( RecordType(..)
     , Replacement(..)
     , backtrackCharacters
+    , blocksOrNewlines
+    , buildTree
     , float
-    , fullTree
     , getFailableBlock
     , getPosition
     , getRangeAndSource
-    , iconParser
-    , indentationString
+    , indentedBlocksOrNewlines
     , indentedString
     , int
-    , manyOf
     , newline
     , newlineWith
     , oneOf
-    , peek
+    , parseInlineFields
     , raggedIndentedStringAbove
     , record
     , skipBlankLineWith
@@ -59,19 +57,16 @@ type alias Range =
     }
 
 
-int : Id -> Parser Context Problem Description
-int id =
+int : Parser Context Problem (Found Int)
+int =
     Parser.map
         (\result ->
             case result of
                 Ok details ->
-                    DescribeInteger
-                        { id = id
-                        , found = details.value
-                        }
+                    Found details.range details.value
 
                 Err details ->
-                    DescribeUnexpected id
+                    Unexpected
                         { range = details.range
                         , problem = Error.BadInt
                         }
@@ -111,19 +106,16 @@ integer =
 
 {-| Parses a float and must end with whitespace, not additional characters.
 -}
-float : Id -> Parser Context Problem Description
-float id =
+float : Parser Context Problem (Found ( String, Float ))
+float =
     Parser.map
         (\result ->
             case result of
                 Ok details ->
-                    DescribeFloat
-                        { id = id
-                        , found = details.value
-                        }
+                    Found details.range details.value
 
                 Err details ->
-                    DescribeUnexpected id
+                    Unexpected
                         { range = details.range
                         , problem = Error.BadFloat
                         }
@@ -172,7 +164,7 @@ indentedString : Int -> String -> Parser Context Problem (Parser.Step String Str
 indentedString indentation found =
     Parser.oneOf
         -- First line, indentation is already handled by the block constructor.
-        [ Parser.succeed (Parser.Done (String.trimRight found))
+        [ Parser.succeed (Parser.Done found)
             |. Parser.end End
         , Parser.succeed
             (\extra ->
@@ -202,12 +194,12 @@ indentedString indentation found =
                 (\str ->
                     Parser.Loop (found ++ str)
                 )
-                |. Parser.token (Parser.Token (indentationString indentation) (ExpectingIndentation indentation))
+                |. Parser.token (Parser.Token (String.repeat indentation " ") (ExpectingIndentation indentation))
                 |= Parser.getChompedString
                     (Parser.chompWhile
                         (\c -> c /= '\n')
                     )
-        , Parser.succeed (Parser.Done (String.trimRight found))
+        , Parser.succeed (Parser.Done found)
         ]
 
 
@@ -237,7 +229,7 @@ raggedIndentedStringAbove indentation found =
                     Parser.Done found
 
                 else
-                    Parser.Loop (found ++ indentationString indentCount ++ str)
+                    Parser.Loop (found ++ String.repeat indentCount " " ++ str)
             )
             |= Parser.oneOf (indentationBetween (indentation + 1) (indentation + 4))
             |= Parser.getChompedString
@@ -264,7 +256,7 @@ indentationBetween lower higher =
             (\numSpaces ->
                 Parser.succeed numSpaces
                     |. Parser.token
-                        (Parser.Token (indentationString numSpaces)
+                        (Parser.Token (String.repeat numSpaces " ")
                             (ExpectingIndentation numSpaces)
                         )
             )
@@ -274,8 +266,28 @@ indentationBetween lower higher =
 
 oneOf blocks expectations context seed =
     let
+        gatherParsers myBlock details =
+            let
+                ( currentSeed, parser ) =
+                    getParserNoBar context details.seed myBlock
+            in
+            case blockName myBlock of
+                Just name ->
+                    { blockNames = name :: details.blockNames
+                    , childBlocks = parser :: details.childBlocks
+                    , childValues = details.childValues
+                    , seed = currentSeed
+                    }
+
+                Nothing ->
+                    { blockNames = details.blockNames
+                    , childBlocks = details.childBlocks
+                    , childValues = Parser.map Ok parser :: details.childValues
+                    , seed = currentSeed
+                    }
+
         children =
-            List.foldl (gatherParsers context)
+            List.foldl gatherParsers
                 { blockNames = []
                 , childBlocks = []
                 , childValues = []
@@ -284,7 +296,7 @@ oneOf blocks expectations context seed =
                 blocks
 
         blockParser =
-            failableBlocks parentId
+            failableBlocks
                 { names = children.blockNames
                 , parsers = children.childBlocks
                 }
@@ -293,73 +305,54 @@ oneOf blocks expectations context seed =
             Id.step seed
     in
     ( children.seed
-    , Parser.oneOf
-        (blockParser
-            :: List.reverse
-                (unexpectedInOneOf parentId expectations
-                    :: children.childValues
-                )
+    , Parser.succeed
+        (\result ->
+            case result of
+                Ok details ->
+                    OneOf
+                        { choices = expectations
+                        , child = Found details.range details.value
+                        , id = parentId
+                        }
+
+                Err details ->
+                    OneOf
+                        { choices = expectations
+                        , child =
+                            Unexpected
+                                { range = details.range
+                                , problem = details.error
+                                }
+                        , id = parentId
+                        }
         )
+        |= withRangeResult
+            (Parser.oneOf
+                (blockParser :: List.reverse (unexpectedInOneOf expectations :: children.childValues))
+            )
     )
 
 
-gatherParsers context =
-    \myBlock details ->
-        let
-            ( currentSeed, parser ) =
-                getParserNoBar context details.seed myBlock
-        in
-        case blockName myBlock of
-            Just name ->
-                { blockNames = name :: details.blockNames
-                , childBlocks = parser :: details.childBlocks
-                , childValues = details.childValues
-                , seed = currentSeed
-                }
-
-            Nothing ->
-                { blockNames = details.blockNames
-                , childBlocks = details.childBlocks
-                , childValues = parser :: details.childValues
-                , seed = currentSeed
-                }
-
-
-unexpectedInOneOf :
-    Id
-    -> List Expectation
-    -> Parser Context Problem Description
-unexpectedInOneOf id expectations =
+unexpectedInOneOf expectations =
     withIndent
         (\indentation ->
             Parser.succeed
-                (\( range, err ) ->
-                    DescribeUnexpected id
-                        { problem = Error.FailMatchOneOf (List.map humanReadableExpectations expectations)
-                        , range = range
-                        }
+                (\( pos, foundWord ) ->
+                    Err (Error.FailMatchOneOf (List.map humanReadableExpectations expectations))
                 )
                 |= withRange word
         )
 
 
-getFailableBlock :
-    ParseContext
-    -> Seed
-    -> Block data
-    -> ( Seed, Parser Context Problem Description )
 getFailableBlock context seed (Block details) =
     case details.kind of
         Named name ->
             let
                 ( newSeed, blockParser ) =
                     details.parser context seed
-
-                ( id, finalSeed ) =
-                    Id.step newSeed
             in
-            ( finalSeed
-            , failableBlocks id
+            ( newSeed
+            , failableBlocks
                 { names = [ name ]
                 , parsers =
                     [ blockParser
@@ -368,13 +361,13 @@ getFailableBlock context seed (Block details) =
             )
 
         Value ->
-            details.parser context seed
+            Tuple.mapSecond (Parser.map Ok) (details.parser context seed)
 
         VerbatimNamed name ->
-            details.parser ParseInline seed
+            Tuple.mapSecond (Parser.map Ok) (details.parser ParseInline seed)
 
         AnnotationNamed name ->
-            details.parser ParseInline seed
+            Tuple.mapSecond (Parser.map Ok) (details.parser ParseInline seed)
 
 
 {-| This parser will either:
@@ -384,27 +377,20 @@ getFailableBlock context seed (Block details) =
     - Parse a `|`, fail to parse the rest and return an Error
 
 -}
-failableBlocks id blocks =
+failableBlocks blocks =
     Parser.succeed identity
         |. Parser.token (Parser.Token "|>" BlockStart)
         |. Parser.chompWhile (\c -> c == ' ')
         |= Parser.oneOf
-            (blocks.parsers
+            (List.map (Parser.map Ok) blocks.parsers
                 ++ [ withIndent
                         (\indentation ->
                             Parser.succeed
-                                (\start end ->
-                                    DescribeUnexpected id
-                                        { range = { start = start, end = end }
-                                        , problem = Error.UnknownBlock blocks.names
-                                        }
-                                )
-                                |= getPosition
+                                (Err (Error.UnknownBlock blocks.names))
                                 |. word
                                 |. Parser.chompWhile (\c -> c == ' ')
                                 |. newline
                                 |. Parser.loop "" (raggedIndentedStringAbove indentation)
-                                |= getPosition
                         )
                    ]
             )
@@ -418,7 +404,6 @@ failableBlocks id blocks =
 type TextCursor
     = TextCursor
         { current : Text
-        , seed : Id.Seed
         , start : Position
         , found : List TextDescription
         , balancedReplacements : List String
@@ -434,10 +419,9 @@ type Replacement
         }
 
 
-textCursor inheritedStyles startingPos seed =
+textCursor inheritedStyles startingPos =
     TextCursor
         { current = Text inheritedStyles ""
-        , seed = seed
         , found = []
         , start = startingPos
         , balancedReplacements = []
@@ -452,110 +436,39 @@ styledText :
     -> Id.Seed
     -> Position
     -> Styling
+    -> List Char
     -> Parser Context Problem Description
-styledText options context seed startingPos inheritedStyles =
+styledText options context seed startingPos inheritedStyles until =
     let
+        vacantText =
+            textCursor inheritedStyles startingPos
+
+        untilStrings =
+            List.map String.fromChar until
+
         meaningful =
-            '1' :: '\\' :: '\n' :: stylingChars ++ replacementStartingChars options.replacements
+            '1' :: '\\' :: '\n' :: until ++ stylingChars ++ replacementStartingChars options.replacements
 
-        indentedSeed : Seed
-        indentedSeed =
-            Id.indent seed
-
-        ( parentId, newSeed ) =
+        ( newId, newSeed ) =
             Id.step seed
+
+        -- TODO: return new seed!
     in
     Parser.oneOf
         [ Parser.map
             (\( pos, textNodes ) ->
                 DescribeText
-                    { id = parentId
+                    { id = newId
+                    , range = pos
                     , text = textNodes
                     }
             )
             (withRange
-                (Parser.loop
-                    (textCursor inheritedStyles startingPos seed)
-                    (styledTextLoop
-                        options
-                        context
-                        meaningful
-                    )
+                (Parser.loop vacantText
+                    (styledTextLoop options context meaningful untilStrings)
                 )
             )
         ]
-
-
-textJustStarted : TextCursor -> Bool
-textJustStarted (TextCursor details) =
-    case details.found of
-        [] ->
-            case details.current of
-                Text _ "" ->
-                    True
-
-                _ ->
-                    False
-
-        _ ->
-            False
-
-
-styleChar style =
-    case style of
-        Italic ->
-            "/"
-
-        Bold ->
-            "*"
-
-        Strike ->
-            "~"
-
-
-addStyleChar chars str =
-    case chars of
-        [] ->
-            str
-
-        char :: remain ->
-            addStyleChar remain (str ++ styleChar char)
-
-
-styleTokens =
-    Parser.succeed
-        (\style following ->
-            case following of
-                "" ->
-                    ( style, [] )
-
-                _ ->
-                    ( style
-                    , List.map
-                        (\c ->
-                            case c of
-                                '/' ->
-                                    Italic
-
-                                '~' ->
-                                    Strike
-
-                                '*' ->
-                                    Bold
-
-                                _ ->
-                                    -- we just parsed this, so this won't occurr
-                                    Bold
-                        )
-                        (String.toList following)
-                    )
-        )
-        |= Parser.oneOf
-            [ Parser.map (always Italic) (Parser.token (Parser.Token "/" (Expecting "/")))
-            , Parser.map (always Strike) (Parser.token (Parser.Token "~" (Expecting "~")))
-            , Parser.map (always Bold) (Parser.token (Parser.Token "*" (Expecting "*")))
-            ]
-        |= Parser.getChompedString (Parser.chompWhile (\c -> c == '/' || c == '~' || c == '*'))
 
 
 {-| -}
@@ -565,67 +478,45 @@ styledTextLoop :
     }
     -> ParseContext
     -> List Char
+    -> List String
     -> TextCursor
     -> Parser Context Problem (Parser.Step TextCursor (List TextDescription))
-styledTextLoop options context meaningful cursor =
+styledTextLoop options context meaningful untilStrings found =
     Parser.oneOf
-        [ Parser.oneOf (replace options.replacements cursor)
+        [ Parser.oneOf (replace options.replacements found)
             |> Parser.map Parser.Loop
 
         -- If a char matches the first character of a replacement,
         -- but didn't match the full replacement captured above,
         -- then stash that char.
-        , Parser.oneOf (almostReplacement options.replacements cursor)
+        , Parser.oneOf (almostReplacement options.replacements found)
             |> Parser.map Parser.Loop
-        , Parser.succeed
-            (\styling ->
-                Parser.Loop (changeStyle cursor styling)
-            )
-            |= styleTokens
-        , case List.filter onlyStandalone options.inlines of
-            standalones ->
-                Parser.succeed
-                    (\src start result end ->
-                        let
-                            range =
-                                { start = start
-                                , end = end
-                                }
-                        in
-                        case result of
-                            Ok ( newCursor, desc ) ->
-                                newCursor
-                                    |> commitText
-                                    |> addToTextCursor
-                                        (InlineBlock
-                                            { kind = EmptyAnnotation
-                                            , record = desc
-                                            }
-                                        )
-                                    |> advanceTo end
-                                    |> Parser.Loop
 
-                            Err err ->
-                                Parser.Loop (addText (sliceRange range src) cursor)
-                    )
-                    |= Parser.getSource
-                    |= getPosition
-                    |= attrContainer cursor standalones
-                    |= getPosition
+        -- Capture style command characters
+        , Parser.succeed
+            (Parser.Loop << changeStyle found)
+            |= Parser.oneOf
+                [ Parser.map (always Italic) (Parser.token (Parser.Token "/" (Expecting "/")))
+                , Parser.map (always Strike) (Parser.token (Parser.Token "~" (Expecting "~")))
+                , Parser.map (always Bold) (Parser.token (Parser.Token "*" (Expecting "*")))
+                ]
 
         -- Parse Selection
         -- depending on selection type, capture attributes if applicable.
         , Parser.succeed
-            (\start ( newCursor, newInlineBlock ) end ->
+            (\start ( maybeNewCursor, newInlineBlock ) end ->
                 let
                     resetCursor curs =
-                        case newCursor of
-                            TextCursor newCursorDetails ->
+                        case maybeNewCursor of
+                            Nothing ->
                                 curs
-                                    |> resetBalancedReplacements newCursorDetails.balancedReplacements
-                                    |> resetTextWith newCursorDetails.current
+
+                            Just (TextCursor newCursor) ->
+                                curs
+                                    |> resetBalancedReplacements newCursor.balancedReplacements
+                                    |> resetTextWith newCursor.current
                 in
-                cursor
+                found
                     |> commitText
                     |> addToTextCursor
                         (newInlineBlock
@@ -638,147 +529,129 @@ styledTextLoop options context meaningful cursor =
                     |> Parser.Loop
             )
             |= getPosition
-            |= (textSelection options.replacements cursor
-                    |> Parser.andThen (parseInlineAttributes options)
+            |= (textSelection options.replacements found
+                    |> Parser.andThen
+                        (\( maybeNewCursor, selection ) ->
+                            Parser.map
+                                (\attrResult ->
+                                    ( maybeNewCursor
+                                    , \range ->
+                                        case attrResult of
+                                            Err [ InlineStart ] ->
+                                                case selection of
+                                                    SelectString str ->
+                                                        Styled range (Text (getCurrentStyle found) str)
+
+                                                    _ ->
+                                                        -- TODO: some sort of real error happend
+                                                        InlineBlock
+                                                            { kind = selection
+                                                            , range =
+                                                                range
+                                                            , record = DescribeNothing (Tuple.first (Id.step Id.initialSeed))
+                                                            }
+
+                                            Err errs ->
+                                                -- TODO: some sort of real error happend
+                                                InlineBlock
+                                                    { kind = selection
+                                                    , range =
+                                                        range
+                                                    , record = DescribeNothing (Tuple.first (Id.step Id.initialSeed))
+                                                    }
+
+                                            Ok foundFields ->
+                                                InlineBlock
+                                                    { kind = selection
+                                                    , range =
+                                                        range
+                                                    , record = foundFields
+                                                    }
+                                    )
+                                )
+                                (attrContainer
+                                    (case selection of
+                                        SelectString _ ->
+                                            List.filterMap onlyVerbatim options.inlines
+
+                                        SelectText _ ->
+                                            List.filterMap onlyAnnotation options.inlines
+
+                                        EmptyAnnotation ->
+                                            -- TODO: parse only normal records
+                                            []
+                                    )
+                                )
+                        )
                )
             |= getPosition
         , -- chomp until a meaningful character
           Parser.succeed
             (\( new, final ) ->
-                if new == "" || final || endingWithEmptyLine new cursor then
-                    case commitAndFinalizeText (addText new cursor) of
+                if new == "" || final then
+                    case commitText (addText (String.trimRight new) found) of
                         TextCursor txt ->
+                            let
+                                styling =
+                                    case txt.current of
+                                        Text s _ ->
+                                            s
+                            in
                             Parser.Done (List.reverse txt.found)
 
                 else
-                    Parser.Loop (addText new cursor)
+                    Parser.Loop (addText new found)
             )
-            |= (Parser.chompWhile (\c -> not (List.member c meaningful))
-                    |> Parser.getChompedString
-                    |> Parser.andThen (finalizeString context)
-               )
-        ]
+            |= (Parser.getChompedString (Parser.chompWhile (\c -> not (List.member c meaningful)))
+                    |> Parser.andThen
+                        (\str ->
+                            Parser.oneOf
+                                [ Parser.succeed ( str, True )
+                                    |. Parser.token (Parser.Token "\n\n" Newline)
+                                , withIndent
+                                    (\indentation ->
+                                        Parser.succeed
+                                            (\finished ->
+                                                case finished of
+                                                    StopWith add ->
+                                                        ( str ++ add, True )
 
-
-endingWithEmptyLine : String -> TextCursor -> Bool
-endingWithEmptyLine new (TextCursor cursor) =
-    if String.endsWith "\n" new && String.isEmpty (String.trim new) then
-        case cursor.current of
-            Text _ str ->
-                String.endsWith "\n" str
-
-    else
-        False
-
-
-parseInlineAttributes :
-    { inlines : List (Block a)
-    , replacements : List Replacement
-    }
-    -> ( TextCursor, InlineSelection )
-    -> Parser Context Problem ( TextCursor, Range -> TextDescription )
-parseInlineAttributes options ( cursor, selection ) =
-    Parser.map
-        (\maybeAttrResult ->
-            ( cursor
-            , \range ->
-                case maybeAttrResult of
-                    Nothing ->
-                        -- no attributes attached, so we capture as a verbatim string
-                        case selection of
-                            SelectString str ->
-                                Styled (Text (getCurrentStyle cursor) str)
-
-                            SelectText txt ->
-                                Styled (Text (getCurrentStyle cursor) "")
-
-                            EmptyAnnotation ->
-                                Styled (Text (getCurrentStyle cursor) "")
-
-                    Just (Err errs) ->
-                        InlineBlock
-                            { kind = selection
-                            , record =
-                                DescribeUnexpected (Id.Id "fail" [])
-                                    { problem =
-                                        Error.UnknownInline
-                                            (List.filterMap (inlineExample selection) options.inlines)
-                                    , range = range
-                                    }
-                            }
-
-                    Just (Ok ( newCursor, foundFields )) ->
-                        InlineBlock
-                            { kind = selection
-                            , record = foundFields
-                            }
-            )
-        )
-        (Parser.oneOf
-            [ Parser.map Just
-                (attrContainer cursor
-                    (case selection of
-                        SelectString _ ->
-                            List.filter onlyVerbatim options.inlines
-
-                        SelectText _ ->
-                            List.filter onlyAnnotation options.inlines
-
-                        EmptyAnnotation ->
-                            -- TODO: parse only normal records
-                            []
-                    )
-                )
-            , Parser.succeed Nothing
-            ]
-        )
-
-
-finalizeString context str =
-    Parser.oneOf
-        [ Parser.succeed ( str, True )
-            |. Parser.token (Parser.Token "\n\n" Newline)
-        , withIndent
-            (\indentation ->
-                Parser.succeed
-                    (\finished ->
-                        case finished of
-                            StopWith add ->
-                                ( str ++ add, True )
-
-                            ContinueWith add ->
-                                ( str ++ add, False )
-                    )
-                    |. Parser.backtrackable (Parser.token (Parser.Token ("\n" ++ indentationString indentation) Newline))
-                    |= Parser.oneOf
-                        ([ Parser.map (always (StopWith "")) (Parser.end End)
-                         , Parser.map (always (StopWith "")) newline
-                         ]
-                            ++ (case context of
-                                    -- in a list context, fail and backtrack if we parse
-                                    --indentation followed by `-` or `1.`
-                                    ParseInTree ->
-                                        [ Parser.backtrackable (Parser.token (Parser.Token "-" Newline))
-                                            |> Parser.andThen (always (Parser.problem (Expecting "---")))
-                                        , Parser.backtrackable (Parser.token (Parser.Token "1." Newline))
-                                            |> Parser.andThen (always (Parser.problem (Expecting "1.")))
-                                        , Parser.map (\c -> ContinueWith ("\n" ++ c))
-                                            (Parser.chompIf (\c -> c /= '-' && c /= '1' && c /= ' ') (Expecting "char")
-                                                |> Parser.getChompedString
+                                                    ContinueWith add ->
+                                                        ( str ++ add, False )
                                             )
-                                        ]
+                                            |. Parser.backtrackable (Parser.token (Parser.Token ("\n" ++ String.repeat indentation " ") Newline))
+                                            |= Parser.oneOf
+                                                ([ Parser.map (always (StopWith "")) (Parser.end End)
+                                                 , Parser.map (always (StopWith "")) newline
+                                                 ]
+                                                    ++ (case context of
+                                                            -- in a list context, fail and backtrack if we parse
+                                                            --indentation followed by `-` or `1.`
+                                                            ParseInTree ->
+                                                                [ Parser.backtrackable (Parser.token (Parser.Token "-" Newline))
+                                                                    |> Parser.andThen (always (Parser.problem (Expecting "---")))
+                                                                , Parser.backtrackable (Parser.token (Parser.Token "1." Newline))
+                                                                    |> Parser.andThen (always (Parser.problem (Expecting "1.")))
+                                                                , Parser.map (\c -> ContinueWith ("\n" ++ c))
+                                                                    (Parser.chompIf (\c -> c /= '-' && c /= '1' && c /= ' ') (Expecting "char")
+                                                                        |> Parser.getChompedString
+                                                                    )
+                                                                ]
 
-                                    _ ->
-                                        [ Parser.succeed (ContinueWith "\n") ]
-                               )
+                                                            _ ->
+                                                                [ Parser.succeed (ContinueWith "\n") ]
+                                                       )
+                                                )
+                                     -- TODO do we need to check that this isn't just a completely blank line?
+                                    )
+                                , Parser.succeed ( str, True )
+                                    |. Parser.token (Parser.Token "\n" Newline)
+                                , Parser.succeed ( str, True )
+                                    |. Parser.end End
+                                , Parser.succeed ( str, False )
+                                ]
                         )
-             -- TODO do we need to check that this isn't just a completely blank line?
-            )
-        , Parser.succeed ( str, True )
-            |. Parser.token (Parser.Token "\n" Newline)
-        , Parser.succeed ( str, True )
-            |. Parser.end End
-        , Parser.succeed ( str, False )
+               )
         ]
 
 
@@ -813,38 +686,36 @@ almostReplacement replacements existing =
     List.map captureChar ('1' :: allFirstChars)
 
 
-textSelection : List Replacement -> TextCursor -> Parser Context Problem ( TextCursor, InlineSelection )
 textSelection replacements found =
     Parser.oneOf
-        [ Parser.succeed (\str -> ( found, SelectString str ))
+        [ Parser.succeed (\str -> ( Nothing, SelectString str ))
             |. Parser.token (Parser.Token "`" (Expecting "`"))
             |= Parser.getChompedString
                 (Parser.chompWhile (\c -> c /= '`' && c /= '\n'))
             |. Parser.chompWhile (\c -> c == '`')
-        , Parser.succeed identity
+        , Parser.succeed
+            (\( txts, cursor ) ->
+                ( Just cursor, SelectText txts )
+            )
             |. Parser.token (Parser.Token "[" (Expecting "["))
-            |= Parser.map (Tuple.mapSecond SelectText)
-                (Parser.loop
-                    (textCursor (getCurrentStyles found)
-                        { offset = 0
-                        , line = 1
-                        , column = 1
-                        }
-                        -- we can't have annotations within annotations
-                        -- and annotations are the only thing in styled text that requires an id
-                        (Id.initialSeed "")
-                    )
-                    (simpleStyledTextTill replacements)
+            |= Parser.loop
+                (textCursor (getCurrentStyles found)
+                    { offset = 0
+                    , line = 1
+                    , column = 1
+                    }
                 )
+                (simpleStyledTextTill [ '\n', ']' ] replacements)
             |. Parser.token (Parser.Token "]" (Expecting "]"))
         ]
 
 
 simpleStyledTextTill :
-    List Replacement
+    List Char
+    -> List Replacement
     -> TextCursor
-    -> Parser Context Problem (Parser.Step TextCursor ( TextCursor, List Text ))
-simpleStyledTextTill replacements cursor =
+    -> Parser Context Problem (Parser.Step TextCursor ( List Text, TextCursor ))
+simpleStyledTextTill until replacements cursor =
     -- options meaningful untilStrings found =
     Parser.oneOf
         [ Parser.oneOf (replace replacements cursor)
@@ -859,11 +730,15 @@ simpleStyledTextTill replacements cursor =
         -- Capture style command characters
         , Parser.succeed
             (Parser.Loop << changeStyle cursor)
-            |= styleTokens
+            |= Parser.oneOf
+                [ Parser.map (always Italic) (Parser.token (Parser.Token "/" (Expecting "/")))
+                , Parser.map (always Strike) (Parser.token (Parser.Token "~" (Expecting "~")))
+                , Parser.map (always Bold) (Parser.token (Parser.Token "*" (Expecting "*")))
+                ]
         , -- chomp until a meaningful character
           Parser.chompWhile
             (\c ->
-                not (List.member c ('\\' :: ']' :: '\n' :: stylingChars ++ replacementStartingChars replacements))
+                not (List.member c ('\\' :: '\n' :: until ++ stylingChars ++ replacementStartingChars replacements))
             )
             |> Parser.getChompedString
             |> Parser.andThen
@@ -879,8 +754,8 @@ simpleStyledTextTill replacements cursor =
                                 in
                                 Parser.succeed
                                     (Parser.Done
-                                        ( TextCursor txt
-                                        , List.reverse <| List.filterMap toText txt.found
+                                        ( List.reverse <| List.filterMap toText txt.found
+                                        , TextCursor txt
                                         )
                                     )
 
@@ -892,7 +767,7 @@ simpleStyledTextTill replacements cursor =
 
 toText textDesc =
     case textDesc of
-        Styled txt ->
+        Styled _ txt ->
             Just txt
 
         _ ->
@@ -918,27 +793,22 @@ If the attributes aren't required (i.e. in a oneOf), then we want to skip to all
 If they are required, then we can fastforward to a specific condition and continue on.
 
 -}
-attrContainer : TextCursor -> List (Block a) -> Tolerant.Parser Context Problem ( TextCursor, Description )
-attrContainer (TextCursor cursor) recordBlocks =
+attrContainer : List (Block a) -> Tolerant.Parser Context Problem Description
+attrContainer recordBlocks =
     Tolerant.succeed identity
-        |. Tolerant.try
-            (Parser.chompIf (\c -> c == '{') (Expecting "{"))
+        |> Tolerant.ignore
+            (Tolerant.token
+                { match = "{"
+                , problem = InlineStart
+                , onError = Tolerant.stopWith InlineStart
+                }
+            )
         |> Tolerant.ignore (Tolerant.chompWhile (\c -> c == ' '))
         |> Tolerant.keep
             (Tolerant.oneOf (ExpectingInlineName "")
                 (recordBlocks
-                    |> List.map
-                        (\rec ->
-                            let
-                                ( newSeed, recordParser ) =
-                                    getParser ParseInline cursor.seed rec
-
-                                newCursor : TextCursor
-                                newCursor =
-                                    TextCursor { cursor | seed = newSeed }
-                            in
-                            Tolerant.try (Parser.map (Tuple.pair newCursor) recordParser)
-                        )
+                    -- NOTE: We're throwing away IDs here, maybe we dont want to do that?
+                    |> List.map (Tolerant.try << Tuple.second << getParser ParseInline Id.initialSeed)
                 )
             )
         |> Tolerant.ignore (Tolerant.chompWhile (\c -> c == ' '))
@@ -955,12 +825,7 @@ attrContainer (TextCursor cursor) recordBlocks =
 {- Style Helpers -}
 
 
-{-| Allow styling to start if preceding text is empty or a space
-
-Allow styling to end if
-
--}
-changeStyle ((TextCursor cursor) as full) ( styleToken, additional ) =
+changeStyle (TextCursor cursor) styleToken =
     let
         cursorText =
             case cursor.current of
@@ -969,19 +834,18 @@ changeStyle ((TextCursor cursor) as full) ( styleToken, additional ) =
 
         newText =
             cursor.current
-                |> flipStyles (styleToken :: additional)
+                |> flipStyle styleToken
                 |> clearText
     in
-    if cursorText == "" && List.isEmpty cursor.found then
+    if cursorText == "" then
         TextCursor
             { found = cursor.found
             , current = newText
             , start = cursor.start
-            , seed = cursor.seed
             , balancedReplacements = cursor.balancedReplacements
             }
 
-    else if stylingAllowed cursor styleToken then
+    else
         let
             end =
                 measure cursor.start cursorText
@@ -989,42 +853,15 @@ changeStyle ((TextCursor cursor) as full) ( styleToken, additional ) =
         TextCursor
             { found =
                 Styled
+                    { start = cursor.start
+                    , end = end
+                    }
                     cursor.current
                     :: cursor.found
             , start = end
             , current = newText
-            , seed = cursor.seed
             , balancedReplacements = cursor.balancedReplacements
             }
-
-    else
-        addText (addStyleChar (styleToken :: additional) "") full
-
-
-stylingAllowed cursor style =
-    case cursor.current of
-        Text styles txt ->
-            case style of
-                Italic ->
-                    if styles.italic then
-                        not (String.endsWith " " txt)
-
-                    else
-                        String.endsWith " " txt
-
-                Bold ->
-                    if styles.bold then
-                        not (String.endsWith " " txt)
-
-                    else
-                        String.endsWith " " txt
-
-                Strike ->
-                    if styles.strike then
-                        not (String.endsWith " " txt)
-
-                    else
-                        String.endsWith " " txt
 
 
 clearText (Text styles _) =
@@ -1045,21 +882,11 @@ flipStyle newStyle textStyle =
                     Text { styles | strike = not styles.strike } str
 
 
-flipStyles styles textStyle =
-    case styles of
-        [] ->
-            textStyle
-
-        top :: remain ->
-            flipStyles remain (flipStyle top textStyle)
-
-
 advanceTo target (TextCursor cursor) =
     TextCursor
         { found = cursor.found
         , current = cursor.current
         , start = target
-        , seed = cursor.seed
         , balancedReplacements = cursor.balancedReplacements
         }
 
@@ -1074,7 +901,6 @@ getStyles (Text styles _) =
 
 measure start textStr =
     let
-        len : Int
         len =
             String.length textStr
     in
@@ -1098,24 +924,15 @@ commitText ((TextCursor cursor) as existingTextCursor) =
             TextCursor
                 { found =
                     Styled
+                        { start = cursor.start
+                        , end = end
+                        }
                         cursor.current
                         :: cursor.found
-                , seed = cursor.seed
                 , start = end
                 , current = Text styles ""
                 , balancedReplacements = cursor.balancedReplacements
                 }
-
-
-{-| Commit text, but also trim all right whitespace as we know we don't need it.
--}
-commitAndFinalizeText (TextCursor cursor) =
-    case cursor.current of
-        Text styles str ->
-            commitText
-                (TextCursor
-                    { cursor | current = Text styles (String.trimRight str) }
-                )
 
 
 getCurrentStyle (TextCursor cursor) =
@@ -1181,7 +998,6 @@ replace replacements existing =
 
                 Balanced range ->
                     let
-                        balanceCache : List String
                         balanceCache =
                             case existing of
                                 TextCursor cursor ->
@@ -1242,7 +1058,6 @@ stylingChars =
     , '/'
     , '*'
     , '\n'
-    , '{'
     , '`'
     ]
 
@@ -1365,11 +1180,9 @@ sliceRange range source =
     else
         -- multiline
         let
-            snippet : String
             snippet =
                 String.slice range.start.offset range.end.offset source
 
-            indented : String
             indented =
                 String.slice (range.start.offset + 1 - range.start.column)
                     range.start.offset
@@ -1418,63 +1231,40 @@ getPosition =
 {- MISC HELPERS -}
 
 
-{-| -}
-onlyStandalone : Block a -> Bool
-onlyStandalone (Block details) =
+onlyVerbatim : Block a -> Maybe (Block a)
+onlyVerbatim ((Block details) as thisBlock) =
     case details.kind of
         Value ->
-            False
+            Nothing
 
         Named name ->
-            True
+            Nothing
 
         VerbatimNamed _ ->
-            False
+            Just thisBlock
 
         AnnotationNamed _ ->
-            False
+            Nothing
 
 
-onlyVerbatim : Block a -> Bool
-onlyVerbatim (Block details) =
+onlyAnnotation : Block a -> Maybe (Block a)
+onlyAnnotation ((Block details) as thisBlock) =
     case details.kind of
         Value ->
-            False
+            Nothing
 
         Named name ->
-            False
+            Nothing
 
         VerbatimNamed _ ->
-            True
+            Nothing
 
         AnnotationNamed _ ->
-            False
-
-
-onlyAnnotation : Block a -> Bool
-onlyAnnotation (Block details) =
-    case details.kind of
-        Value ->
-            False
-
-        Named name ->
-            False
-
-        VerbatimNamed _ ->
-            False
-
-        AnnotationNamed _ ->
-            True
+            Just thisBlock
 
 
 {-| -}
-
-
-
--- manyOf : Int -> List (Block a) ->
-
-
-manyOf indentation blocks cursor =
+blocksOrNewlines indentation blocks cursor =
     Parser.oneOf
         [ Parser.end End
             |> Parser.map
@@ -1493,7 +1283,11 @@ manyOf indentation blocks cursor =
             -- First thing already has indentation accounted for.
             makeBlocksParser blocks cursor.seed
                 |> Parser.map
-                    (\( newSeed, foundBlock ) ->
+                    (\foundBlock ->
+                        let
+                            ( _, newSeed ) =
+                                Id.step cursor.seed
+                        in
                         Parser.Loop
                             { parsedSomething = True
                             , found = foundBlock :: cursor.found
@@ -1504,14 +1298,18 @@ manyOf indentation blocks cursor =
           else
             Parser.oneOf
                 [ Parser.succeed
-                    (\( newSeed, foundBlock ) ->
+                    (\foundBlock ->
+                        let
+                            ( _, newSeed ) =
+                                Id.step cursor.seed
+                        in
                         Parser.Loop
                             { parsedSomething = True
                             , found = foundBlock :: cursor.found
                             , seed = newSeed
                             }
                     )
-                    |. Parser.token (Parser.Token (indentationString indentation) (ExpectingIndentation indentation))
+                    |. Parser.token (Parser.Token (String.repeat indentation " ") (ExpectingIndentation indentation))
                     |= makeBlocksParser blocks cursor.seed
                 , Parser.succeed
                     (Parser.Loop
@@ -1543,26 +1341,27 @@ manyOf indentation blocks cursor =
 
 makeBlocksParser blocks seed =
     let
-        gatherParsers2 myBlock details =
+        gatherParsers myBlock details =
             let
-                ( newSeed, parser ) =
+                -- We don't care about the new seed because that's handled by the loop.
+                ( _, parser ) =
                     getParserNoBar ParseBlock seed myBlock
             in
             case blockName myBlock of
                 Just name ->
                     { blockNames = name :: details.blockNames
-                    , childBlocks = Parser.map (Tuple.pair newSeed) parser :: details.childBlocks
+                    , childBlocks = Parser.map Ok parser :: details.childBlocks
                     , childValues = details.childValues
                     }
 
                 Nothing ->
                     { blockNames = details.blockNames
                     , childBlocks = details.childBlocks
-                    , childValues = Parser.map (Tuple.pair newSeed) parser :: details.childValues
+                    , childValues = Parser.map Ok (withRange parser) :: details.childValues
                     }
 
         children =
-            List.foldl gatherParsers2
+            List.foldl gatherParsers
                 { blockNames = []
                 , childBlocks = []
                 , childValues = []
@@ -1570,32 +1369,30 @@ makeBlocksParser blocks seed =
                 blocks
 
         blockParser =
-            Parser.succeed identity
-                |. Parser.token (Parser.Token "|>" BlockStart)
-                |. Parser.chompWhile (\c -> c == ' ')
-                |= Parser.oneOf
-                    (List.reverse children.childBlocks
-                        ++ [ withIndent
-                                (\indentation ->
-                                    Parser.succeed
-                                        (\( pos, foundWord ) ->
-                                            let
-                                                ( newId, newSeed ) =
-                                                    Id.step seed
-                                            in
-                                            ( newSeed
-                                            , DescribeUnexpected newId
-                                                { problem = Error.UnknownBlock children.blockNames
-                                                , range = pos
-                                                }
-                                            )
+            Parser.map
+                (\( pos, result ) ->
+                    Result.map (\desc -> ( pos, desc )) result
+                )
+                (withRange
+                    (Parser.succeed identity
+                        |. Parser.token (Parser.Token "|>" BlockStart)
+                        |. Parser.chompWhile (\c -> c == ' ')
+                        |= Parser.oneOf
+                            (List.reverse children.childBlocks
+                                ++ [ withIndent
+                                        (\indentation ->
+                                            Parser.succeed
+                                                (\( pos, foundWord ) ->
+                                                    Err ( pos, Error.UnknownBlock children.blockNames )
+                                                )
+                                                |= withRange word
+                                                |. newline
+                                                |. Parser.loop "" (raggedIndentedStringAbove indentation)
                                         )
-                                        |= withRange word
-                                        |. newline
-                                        |. Parser.loop "" (raggedIndentedStringAbove indentation)
-                                )
-                           ]
+                                   ]
+                            )
                     )
+                )
     in
     Parser.oneOf
         (blockParser
@@ -1606,609 +1403,109 @@ makeBlocksParser blocks seed =
 type alias NestedIndex =
     { base : Int
     , prev : Int
-    , seed : Id.Seed
     }
 
 
-peek : String -> Parser c p thing -> Parser c p thing
-peek name parser =
-    Parser.succeed
-        (\start val end src ->
-            let
-                _ =
-                    Debug.log name
-                        (String.slice start.offset end.offset src)
-            in
-            val
-        )
-        |= getPosition
-        |= parser
-        |= getPosition
-        |= Parser.getSource
-
-
-peekLoop : String -> Parser c p (Parser.Step one two) -> Parser c p (Parser.Step one two)
-peekLoop name parser =
-    Parser.succeed
-        (\start val end src ->
-            let
-                loop : String
-                loop =
-                    case val of
-                        Parser.Loop _ ->
-                            " -> loop"
-
-                        Parser.Done _ ->
-                            " -> done"
-
-                _ =
-                    Debug.log (name ++ loop)
-                        (String.slice start.offset end.offset src)
-            in
-            val
-        )
-        |= getPosition
-        |= parser
-        |= getPosition
-        |= Parser.getSource
-
-
-type alias TreeCursor =
-    { captured : List Description
-
-    -- stack is reverse ordered.  Things a the front are closer to leaves in the tree
-    , stack :
-        List
-            { start : Position
-            , description : Description
-            }
-    , previouslyAdded : PreviouslyAdded
+type alias FlatCursor =
+    { icon : Maybe Icon
+    , indent : Int
+    , content : Description
     }
 
 
-type PreviouslyAdded
-    = AddedContent
-    | AddedItem
+{-| Results in a flattened version of the parsed list.
 
+    ( 0, Maybe Icon, [ "item one" ] )
 
-{-| Parse a full nested tree in one go.
+    ( 0, Maybe Icon, [ "item two" ] )
+
+    ( 4, Maybe Icon, [ "nested item two", "additional text for nested item two" ] )
+
+    ( 0, Maybe Icon, [ "item three" ] )
+
+    ( 4, Maybe Icon, [ "nested item three" ] )
+
 -}
-fullTree :
+indentedBlocksOrNewlines :
     ParseContext
+    -> Id.Seed
     -> Block thing
-    -> ( NestedIndex, TreeCursor )
-    -> Parser Context Problem (Parser.Step ( NestedIndex, TreeCursor ) (List Description))
-fullTree context item ( indentation, existing ) =
+    -> ( NestedIndex, List FlatCursor )
+    -> Parser Context Problem (Parser.Step ( NestedIndex, List FlatCursor ) (List FlatCursor))
+indentedBlocksOrNewlines context seed item ( indentation, existing ) =
     Parser.oneOf
-        [ Parser.succeed (\pos -> Parser.Done (finalize existing pos))
-            |= getPosition
-            |. Parser.end End
+        [ Parser.end End
+            |> Parser.map
+                (\_ ->
+                    Parser.Done (List.reverse existing)
+                )
 
         -- Whitespace Line
         , skipBlankLineWith (Parser.Loop ( indentation, existing ))
         , Parser.oneOf
             [ -- block with required indent
-              parseIndentation indentation.base indentation.prev
+              expectIndentation indentation.base indentation.prev
                 |> Parser.andThen
-                    (parseIndentedItem context item indentation existing)
+                    (\newIndent ->
+                        let
+                            ( itemSeed, itemParser ) =
+                                getParser context seed item
+                        in
+                        -- If the indent has changed, then the delimiter is required
+                        Parser.withIndent newIndent <|
+                            Parser.oneOf
+                                ((Parser.succeed
+                                    (\iconResult itemResult ->
+                                        let
+                                            newIndex =
+                                                { prev = newIndent
+                                                , base = indentation.base
+                                                }
+                                        in
+                                        Parser.Loop
+                                            ( newIndex
+                                            , { indent = newIndent
+                                              , icon = Just iconResult
+                                              , content = itemResult
+                                              }
+                                                :: existing
+                                            )
+                                    )
+                                    |= iconParser
+                                    |= Parser.withIndent (newIndent + 4) itemParser
+                                 )
+                                    :: (if newIndent - 4 == indentation.prev then
+                                            [ itemParser
+                                                |> Parser.map
+                                                    (\foundBlock ->
+                                                        let
+                                                            newIndex =
+                                                                { prev = indentation.prev
+                                                                , base = indentation.base
+                                                                }
+                                                        in
+                                                        Parser.Loop
+                                                            ( newIndex
+                                                            , { indent = indentation.prev
+                                                              , icon = Nothing
+                                                              , content = foundBlock
+                                                              }
+                                                                :: existing
+                                                            )
+                                                    )
+                                            ]
+
+                                        else
+                                            []
+                                       )
+                                )
+                    )
 
             -- We reach here because the indentation parsing was not successful,
             -- This means any issues are handled by whatever parser comes next.
-            , Parser.succeed
-                (\pos ->
-                    Parser.Done (finalize existing pos)
-                )
-                |= getPosition
+            , Parser.succeed (Parser.Done (List.reverse existing))
             ]
         ]
-
-
-finalize : TreeCursor -> Position -> List Description
-finalize cursor end =
-    case collapseAll end cursor.stack of
-        Just last ->
-            List.foldl
-                (\cap captured ->
-                    reverseTree cap :: captured
-                )
-                []
-                (last :: cursor.captured)
-
-        Nothing ->
-            List.foldl
-                (\cap captured ->
-                    reverseTree cap :: captured
-                )
-                []
-                cursor.captured
-
-
-topHasChildren stack =
-    case stack of
-        [] ->
-            False
-
-        top :: _ ->
-            case top.description of
-                DescribeItem item ->
-                    case item.children of
-                        [] ->
-                            False
-
-                        _ ->
-                            True
-
-                _ ->
-                    False
-
-
-parseIndentedItem :
-    ParseContext
-    -> Block thing
-    -> NestedIndex
-    -> TreeCursor
-    -> Int
-    -> Parser Context Problem (Parser.Step ( NestedIndex, TreeCursor ) (List Description))
-parseIndentedItem context block indentation existing newIndent =
-    let
-        iconRequired : Bool
-        iconRequired =
-            -- icon required if the indentation is at the base
-            (indentation.base == newIndent)
-                -- or if indentation hasn't changed and we've already parsed child for the top of the stack
-                || (indentation.prev
-                        == newIndent
-                        && topHasChildren existing.stack
-                   )
-
-        newSeed : Seed
-        newSeed =
-            if newIndent > indentation.prev then
-                Id.indent indentation.seed
-
-            else if newIndent == indentation.prev then
-                -- This may look weird
-                -- but this loop is started with an indented id, which should be unique.
-                -- Therefore we only need to increment it after the first thing found
-                case existing.stack of
-                    [] ->
-                        indentation.seed
-
-                    _ ->
-                        Id.step indentation.seed
-                            |> Tuple.second
-
-            else
-                Id.dedent ((indentation.prev - newIndent) // 4) indentation.seed
-                    -- we're back in old land, so we have to increment to avoid a collision
-                    |> Id.step
-                    |> Tuple.second
-
-        ( itemId, itemSeed ) =
-            Id.step newSeed
-
-        ( finalSeed, itemParser ) =
-            getParser context itemSeed block
-
-        newIndex =
-            { prev = newIndent
-            , seed =
-                finalSeed
-            , base = indentation.base
-            }
-    in
-    -- if newIndent == indentation.prev then
-    -- If indentation has not changed
-    -- - With Icon ->
-    --     child for top of stack
-    -- - No Icon ->
-    --     if no children,
-    --         content for top of stack
-    --     else
-    --         failure
-    Parser.succeed
-        (\start maybeIcon item itemEnd ->
-            if newIndent == indentation.prev then
-                case existing.stack of
-                    [] ->
-                        Parser.Loop
-                            ( newIndex
-                            , existing
-                            )
-
-                    top :: [] ->
-                        case maybeIcon of
-                            -- no icon,
-                            -- this is a second content block
-                            Nothing ->
-                                case top.description of
-                                    DescribeItem topDetails ->
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedContent
-                                                , stack =
-                                                    [ { start = start
-                                                      , description =
-                                                            DescribeItem
-                                                                { topDetails
-                                                                    | content =
-                                                                        item
-                                                                            :: topDetails.content
-                                                                }
-                                                      }
-                                                    ]
-                                              }
-                                            )
-
-                                    _ ->
-                                        Parser.Loop
-                                            ( newIndex
-                                            , existing
-                                            )
-
-                            Just icon ->
-                                -- same indentaion as the previous one.
-                                case existing.previouslyAdded of
-                                    AddedItem ->
-                                        -- if previous was an item, then this is a new item entirely
-                                        --
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedItem
-                                                , captured =
-                                                    top.description
-                                                        :: existing.captured
-                                                , stack =
-                                                    [ { start = start
-                                                      , description =
-                                                            DescribeItem
-                                                                { id = itemId
-                                                                , icon = icon
-                                                                , content =
-                                                                    [ item
-                                                                    ]
-                                                                , children = []
-                                                                }
-                                                      }
-                                                    ]
-                                              }
-                                            )
-
-                                    AddedContent ->
-                                        -- if previous was content, then this is a new nested item
-                                        --
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedItem
-                                                , stack =
-                                                    { start = start
-                                                    , description =
-                                                        DescribeItem
-                                                            { id = itemId
-                                                            , icon = icon
-                                                            , content =
-                                                                [ item
-                                                                ]
-                                                            , children = []
-                                                            }
-                                                    }
-                                                        :: existing.stack
-                                              }
-                                            )
-
-                    top :: pen :: remain ->
-                        case maybeIcon of
-                            Nothing ->
-                                -- No Icon, add to content
-                                -- Actually, this shouldn't be allowed
-                                -- But when we move to allow content everywhere, then it can be allowed
-                                case top.description of
-                                    DescribeItem topDetails ->
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedContent
-                                                , stack =
-                                                    { start = top.start
-                                                    , description =
-                                                        DescribeItem
-                                                            { topDetails
-                                                                | content =
-                                                                    item
-                                                                        :: topDetails.content
-                                                            }
-                                                    }
-                                                        :: remain
-                                              }
-                                            )
-
-                                    _ ->
-                                        Parser.Loop
-                                            ( newIndex
-                                            , existing
-                                            )
-
-                            Just icon ->
-                                case existing.previouslyAdded of
-                                    AddedContent ->
-                                        -- "close" previous item, and add item as the new one.of
-                                        -- so top gets merged into pen
-                                        case pen.description of
-                                            DescribeItem penDetails ->
-                                                Parser.Loop
-                                                    ( newIndex
-                                                    , { existing
-                                                        | previouslyAdded = AddedItem
-                                                        , stack =
-                                                            { start = start
-                                                            , description =
-                                                                DescribeItem
-                                                                    { id = itemId
-                                                                    , icon = icon
-                                                                    , content =
-                                                                        [ item
-                                                                        ]
-                                                                    , children = []
-                                                                    }
-                                                            }
-                                                                :: top
-                                                                :: pen
-                                                                :: remain
-                                                      }
-                                                    )
-
-                                            _ ->
-                                                Parser.Loop
-                                                    ( newIndex
-                                                    , existing
-                                                    )
-
-                                    AddedItem ->
-                                        -- Prevous thing was an item.
-                                        -- means we can fold top into pen
-                                        -- and add our new item as the top
-                                        case pen.description of
-                                            DescribeItem penDetails ->
-                                                Parser.Loop
-                                                    ( newIndex
-                                                    , { existing
-                                                        | previouslyAdded = AddedItem
-                                                        , stack =
-                                                            { start = start
-                                                            , description =
-                                                                DescribeItem
-                                                                    { id = itemId
-                                                                    , icon = icon
-                                                                    , content =
-                                                                        [ item
-                                                                        ]
-                                                                    , children = []
-                                                                    }
-                                                            }
-                                                                :: { start = pen.start
-                                                                   , description =
-                                                                        DescribeItem
-                                                                            { penDetails
-                                                                                | children =
-                                                                                    top.description
-                                                                                        :: penDetails.children
-                                                                            }
-                                                                   }
-                                                                -- :: top
-                                                                -- :: pen
-                                                                :: remain
-                                                      }
-                                                    )
-
-                                            _ ->
-                                                Parser.Loop
-                                                    ( newIndex
-                                                    , existing
-                                                    )
-
-            else if newIndent > indentation.prev then
-                case existing.stack of
-                    [] ->
-                        Parser.Loop
-                            ( newIndex
-                            , existing
-                            )
-
-                    top :: remain ->
-                        case top.description of
-                            DescribeItem topDetails ->
-                                case maybeIcon of
-                                    Nothing ->
-                                        -- No Icon, and indented, add to content
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedContent
-                                                , stack =
-                                                    { start = top.start
-                                                    , description =
-                                                        DescribeItem
-                                                            { topDetails
-                                                                | content =
-                                                                    item
-                                                                        :: topDetails.content
-                                                            }
-                                                    }
-                                                        :: remain
-                                              }
-                                            )
-
-                                    Just icon ->
-                                        -- we have an icon, add to children
-                                        Parser.Loop
-                                            ( newIndex
-                                            , { existing
-                                                | previouslyAdded = AddedItem
-                                                , stack =
-                                                    { start = start
-                                                    , description =
-                                                        DescribeItem
-                                                            { id = itemId
-                                                            , icon = icon
-                                                            , content =
-                                                                [ item
-                                                                ]
-                                                            , children = []
-                                                            }
-                                                    }
-                                                        :: top
-                                                        :: remain
-                                              }
-                                            )
-
-                            _ ->
-                                Parser.Loop
-                                    ( newIndex
-                                    , existing
-                                    )
-
-            else
-                -- Dedented
-                -- multiple dedentations are allowed,
-                -- so we need to see how far we need to collapse
-                let
-                    level : Int
-                    level =
-                        case existing.previouslyAdded of
-                            AddedItem ->
-                                -- we dedented, but previous was an item
-                                -- so we need to collapse twice
-                                ((indentation.prev - newIndent) // 4) + 1
-
-                            AddedContent ->
-                                -- we dedented, but previous was
-                                (indentation.prev - newIndent) // 4
-
-                    ( collapsed, maybeCaptured ) =
-                        collapse start level existing.stack
-                in
-                Parser.Loop
-                    ( newIndex
-                    , { existing
-                        | previouslyAdded = AddedItem
-                        , stack =
-                            { start = start
-                            , description =
-                                DescribeItem
-                                    { id = itemId
-                                    , icon = Maybe.withDefault Bullet maybeIcon
-                                    , content =
-                                        [ item
-                                        ]
-                                    , children = []
-                                    }
-                            }
-                                :: collapsed
-                        , captured =
-                            case maybeCaptured of
-                                Nothing ->
-                                    existing.captured
-
-                                Just capped ->
-                                    capped :: existing.captured
-                      }
-                    )
-        )
-        |= getPosition
-        |= (if iconRequired then
-                Parser.map Just iconParser
-
-            else
-                Parser.oneOf
-                    [ Parser.map Just iconParser
-                    , Parser.succeed Nothing
-                    ]
-           )
-        |= Parser.withIndent (newIndent + 4) itemParser
-        |= getPosition
-
-
-collapse :
-    Position
-    -> Int
-    ->
-        List
-            { start : Position
-            , description : Description
-            }
-    ->
-        ( List
-            { start : Position
-            , description : Description
-            }
-        , Maybe Description
-        )
-collapse end level stack =
-    if level == 0 then
-        ( stack, Nothing )
-
-    else
-        case stack of
-            [] ->
-                ( stack, Nothing )
-
-            top :: [] ->
-                ( []
-                , Just
-                    top.description
-                )
-
-            top :: penultimate :: remain ->
-                case penultimate.description of
-                    DescribeItem pen ->
-                        collapse end
-                            (level - 1)
-                            ({ description =
-                                DescribeItem
-                                    { pen
-                                        | children =
-                                            top.description
-                                                :: pen.children
-                                    }
-                             , start = penultimate.start
-                             }
-                                :: remain
-                            )
-
-                    _ ->
-                        ( stack, Nothing )
-
-
-collapseAll : Position -> List { start : Position, description : Description } -> Maybe Description
-collapseAll end stack =
-    case stack of
-        [] ->
-            Nothing
-
-        top :: [] ->
-            Just top.description
-
-        top :: penultimate :: remain ->
-            case penultimate.description of
-                DescribeItem item ->
-                    collapseAll end
-                        ({ description =
-                            DescribeItem
-                                { item
-                                    | children =
-                                        item.children
-                                            ++ [ top.description ]
-                                }
-                         , start = penultimate.start
-                         }
-                            :: remain
-                        )
-
-                _ ->
-                    Nothing
 
 
 type RecordType
@@ -2216,30 +1513,29 @@ type RecordType
     | BlockRecord
 
 
-record :
-    RecordType
-    -> Id
-    -> Id
-    -> String
-    -> Expectation
-    -> List ( String, Parser Context Problem ( String, Description ) )
-    -> Parser Context Problem Description
-record recordType id failureId recordName expectations fields =
+record recordType id recordName expectations fields =
     Parser.succeed
         (\result ->
             case result of
                 Ok details ->
                     Record
-                        { id = id
+                        { expected = expectations
+                        , id = id
                         , name = recordName
                         , found =
-                            details.value
+                            Found (backtrackCharacters 2 details.range) details.value
                         }
 
                 Err err ->
-                    DescribeUnexpected id
-                        { range = Maybe.withDefault err.range (Tuple.first err.error)
-                        , problem = Tuple.second err.error
+                    Record
+                        { expected = expectations
+                        , id = id
+                        , name = recordName
+                        , found =
+                            Unexpected
+                                { range = Maybe.withDefault (backtrackCharacters 2 err.range) (Tuple.first err.error)
+                                , problem = Tuple.second err.error
+                                }
                         }
         )
         |= withRangeResult
@@ -2266,7 +1562,7 @@ record recordType id failureId recordName expectations fields =
                                                     { remaining = fields
                                                     , found = Ok []
                                                     }
-                                                    (parseInlineFields failureId recordName (List.map Tuple.first fields))
+                                                    (parseInlineFields recordName (List.map Tuple.first fields))
 
                                             BlockRecord ->
                                                 Parser.withIndent (indentation + 4)
@@ -2274,7 +1570,7 @@ record recordType id failureId recordName expectations fields =
                                                         { remaining = fields
                                                         , found = Ok []
                                                         }
-                                                        (parseFields failureId recordName (List.map Tuple.first fields))
+                                                        (parseFields recordName (List.map Tuple.first fields))
                                                     )
                                        )
                            )
@@ -2294,9 +1590,9 @@ backtrackCharacters chars range =
 
 type alias RecordFields =
     { remaining :
-        List ( String, Parser Context Problem ( String, Description ) )
+        List ( String, Parser Context Problem ( String, Found Description ) )
     , found :
-        Result ( Maybe Range, Error.Error ) (List ( String, Description ))
+        Result ( Maybe Range, Error.Error ) (List ( String, Found Description ))
     }
 
 
@@ -2306,36 +1602,13 @@ type Indented thing
     | EmptyLine
 
 
-indentationString n =
-    case n of
-        0 ->
-            ""
-
-        4 ->
-            "    "
-
-        8 ->
-            "        "
-
-        12 ->
-            "            "
-
-        16 ->
-            "                "
-
-        _ ->
-            -- this just allocates a bunch more than is needed
-            String.repeat n " "
-
-
 {-| -}
 parseFields :
-    Id
-    -> String
+    String
     -> List String
     -> RecordFields
-    -> Parser Context Problem (Parser.Step RecordFields (Result ( Maybe Range, Error.Error ) (List ( String, Description ))))
-parseFields failureId recordName fieldNames fields =
+    -> Parser Context Problem (Parser.Step RecordFields (Result ( Maybe Range, Error.Error ) (List ( String, Found Description ))))
+parseFields recordName fieldNames fields =
     case fields.remaining of
         [] ->
             withIndent
@@ -2360,7 +1633,7 @@ parseFields failureId recordName fieldNames fields =
                         |= Parser.oneOf
                             [ Parser.succeed identity
                                 |. Parser.token
-                                    (Parser.Token (indentationString indentation)
+                                    (Parser.Token (String.repeat indentation " ")
                                         (ExpectingIndentation indentation)
                                     )
                                 |= Parser.getChompedString (Parser.chompWhile (\c -> c /= '\n'))
@@ -2374,7 +1647,7 @@ parseFields failureId recordName fieldNames fields =
                     withIndent
                         (\indentation ->
                             Parser.oneOf
-                                [ indentOrSkip indentation (captureField failureId found recordName fields fieldNames)
+                                [ indentOrSkip indentation (captureField found recordName fields fieldNames)
                                     |> Parser.map
                                         (\indentedField ->
                                             case indentedField of
@@ -2435,7 +1708,7 @@ indentOrSkip :
 indentOrSkip indentation successParser =
     Parser.oneOf
         [ Parser.succeed identity
-            |. Parser.token (Parser.Token (indentationString indentation) (ExpectingIndentation indentation))
+            |. Parser.token (Parser.Token (String.repeat indentation " ") (ExpectingIndentation indentation))
             |= Parser.oneOf
                 [ Parser.map (always EmptyLine) newline
                 , Parser.succeed
@@ -2477,42 +1750,48 @@ indentOrSkip indentation successParser =
 
 
 captureField :
-    Id
-    -> List ( String, Description )
+    List ( String, Found Description )
     -> String
     -> RecordFields
     -> List String
     -> Parser Context Problem (Parser.Step RecordFields a)
-captureField failureId found recordName fields fieldNames =
+captureField found recordName fields fieldNames =
     Parser.map
         (\maybeField ->
             case maybeField of
                 Nothing ->
                     Parser.Loop fields
 
-                Just ( fieldPos, ( foundFieldname, fieldValue ) ) ->
-                    Parser.Loop
-                        { found = Ok (( foundFieldname, fieldValue ) :: found)
-                        , remaining =
-                            List.filter
-                                (\( fieldParserName, _ ) -> fieldParserName /= foundFieldname)
-                                fields.remaining
-                        }
+                Just ( foundFieldname, fieldValue ) ->
+                    case fieldValue of
+                        Found _ _ ->
+                            Parser.Loop
+                                { found = Ok (( foundFieldname, fieldValue ) :: found)
+                                , remaining =
+                                    List.filter
+                                        (\( fieldParserName, _ ) -> fieldParserName /= foundFieldname)
+                                        fields.remaining
+                                }
+
+                        Unexpected unexpected ->
+                            Parser.Loop
+                                { found = Err ( Just unexpected.range, unexpected.problem )
+                                , remaining =
+                                    List.filter
+                                        (\( fieldParserName, _ ) -> fieldParserName /= foundFieldname)
+                                        fields.remaining
+                                }
         )
         (Parser.oneOf
             (List.map (Parser.map Just << parseField) fields.remaining
-                ++ [ Parser.map Just (unexpectedField failureId recordName fieldNames)
+                ++ [ Parser.map Just (unexpectedField recordName fieldNames)
                    ]
             )
         )
 
 
-{-| Parse a field name
--}
-parseField : ( String, Parser Context Problem ( String, Description ) ) -> Parser Context Problem ( Position, ( String, Description ) )
 parseField ( name, contentParser ) =
-    Parser.succeed Tuple.pair
-        |= getPosition
+    Parser.succeed identity
         |. Parser.keyword (Parser.Token name (ExpectingFieldName name))
         |. Parser.chompWhile (\c -> c == ' ')
         |. Parser.chompIf (\c -> c == '=') (Expecting "=")
@@ -2520,24 +1799,21 @@ parseField ( name, contentParser ) =
         |= contentParser
 
 
-unexpectedField : Id -> String -> List String -> Parser Context Problem ( Position, ( String, Description ) )
-unexpectedField id recordName options =
+unexpectedField recordName options =
     withIndent
         (\indentation ->
             Parser.map
                 (\{ range, value } ->
-                    ( range.start
-                    , ( value
-                      , DescribeUnexpected id
-                            { range = range
-                            , problem =
-                                Error.UnexpectedField
-                                    { found = value
-                                    , options = options
-                                    , recordName = recordName
-                                    }
-                            }
-                      )
+                    ( value
+                    , Unexpected
+                        { range = range
+                        , problem =
+                            Error.UnexpectedField
+                                { found = value
+                                , options = options
+                                , recordName = recordName
+                                }
+                        }
                     )
                 )
                 (getRangeAndSource
@@ -2561,14 +1837,12 @@ unexpectedField id recordName options =
 
 {-| -}
 parseInlineFields :
-    Id
-    -> String
+    String
     -> List String
     -> RecordFields
-    -> Parser Context Problem (Parser.Step RecordFields (Result ( Maybe Range, Error.Error ) (List ( String, Description ))))
-parseInlineFields failureId recordName fieldNames fields =
+    -> Parser Context Problem (Parser.Step RecordFields (Result ( Maybe Range, Error.Error ) (List ( String, Found Description ))))
+parseInlineFields recordName fieldNames fields =
     let
-        hasMore : Bool
         hasMore =
             case fields.remaining of
                 [] ->
@@ -2610,7 +1884,7 @@ parseInlineFields failureId recordName fieldNames fields =
                     Parser.oneOf
                         [ Parser.succeed identity
                             |. Parser.chompWhile (\c -> c == ' ')
-                            |= captureField failureId found recordName fields fieldNames
+                            |= captureField found recordName fields fieldNames
                             |. Parser.chompWhile (\c -> c == ' ')
                             |. (if hasMore then
                                     Parser.token (Parser.Token "," (Expecting ","))
@@ -2654,14 +1928,14 @@ Based on the previous indentation:
 If we don't match the above rules, we might want to count the mismatched number.
 
 -}
-parseIndentation : Int -> Int -> Parser Context Problem Int
-parseIndentation base previous =
+expectIndentation : Int -> Int -> Parser Context Problem Int
+expectIndentation base previous =
     Parser.succeed Tuple.pair
         |= Parser.oneOf
             ([ Parser.succeed (previous + 4)
-                |. Parser.token (Parser.Token (indentationString (previous + 4)) (ExpectingIndentation (previous + 4)))
+                |. Parser.token (Parser.Token (String.repeat (previous + 4) " ") (ExpectingIndentation (previous + 4)))
              , Parser.succeed previous
-                |. Parser.token (Parser.Token (indentationString previous) (ExpectingIndentation previous))
+                |. Parser.token (Parser.Token (String.repeat previous " ") (ExpectingIndentation previous))
              ]
                 ++ descending base previous
             )
@@ -2677,7 +1951,6 @@ parseIndentation base previous =
             )
 
 
-iconParser : Parser c Problem Icon
 iconParser =
     Parser.oneOf
         [ Parser.succeed Bullet
@@ -2717,28 +1990,336 @@ descending base prev =
                             base + (x * 4)
                     in
                     Parser.succeed level
-                        |. Parser.token (Parser.Token (indentationString level) (ExpectingIndentation level))
+                        |. Parser.token (Parser.Token (String.repeat level " ") (ExpectingIndentation level))
                 )
                 (List.range 0 (((prev - 4) - base) // 4))
             )
 
 
-reverseTree : Description -> Description
-reverseTree nest =
-    case nest of
-        DescribeItem item ->
-            DescribeItem
-                { id = item.id
-                , icon = item.icon
-                , content = List.reverse item.content
-                , children =
-                    List.foldl
-                        (\cap captured ->
-                            reverseTree cap :: captured
-                        )
-                        []
-                        item.children
+buildTree : Int -> List FlatCursor -> List (Nested Description)
+buildTree baseIndent items =
+    let
+        -- gather ( indentation, icon, item ) (TreeBuilder builder) =
+        gather item builder =
+            addItem (item.indent - baseIndent) item.icon item.content builder
+
+        groupByIcon item maybeCursor =
+            case maybeCursor of
+                Nothing ->
+                    case item.icon of
+                        Just icon ->
+                            Just
+                                { indent = item.indent
+                                , icon = icon
+                                , items = [ item.content ]
+                                , accumulated = []
+                                }
+
+                        Nothing ->
+                            -- Because of how the code runs, we have a tenuous guarantee that this branch won't execute.
+                            -- Not entirely sure how to make the types work to eliminate this.
+                            Nothing
+
+                Just cursor ->
+                    Just <|
+                        case item.icon of
+                            Nothing ->
+                                { indent = cursor.indent
+                                , icon = cursor.icon
+                                , items = item.content :: cursor.items
+                                , accumulated = cursor.accumulated
+                                }
+
+                            Just icon ->
+                                { indent = item.indent
+                                , icon = icon
+                                , items = [ item.content ]
+                                , accumulated =
+                                    { indent = cursor.indent
+                                    , icon = cursor.icon
+                                    , content = cursor.items
+                                    }
+                                        :: cursor.accumulated
+                                }
+
+        finalizeGrouping maybeCursor =
+            case maybeCursor of
+                Nothing ->
+                    []
+
+                Just cursor ->
+                    case cursor.items of
+                        [] ->
+                            cursor.accumulated
+
+                        _ ->
+                            { indent = cursor.indent
+                            , icon = cursor.icon
+                            , content = cursor.items
+                            }
+                                :: cursor.accumulated
+
+        newTree =
+            items
+                |> List.foldl groupByIcon Nothing
+                |> finalizeGrouping
+                |> List.reverse
+                |> List.foldl gather emptyTreeBuilder
+    in
+    case newTree of
+        TreeBuilder builder ->
+            List.reverse (renderLevels builder.levels)
+
+
+{-| A list item started with a list icon.
+
+If indent stays the same
+-> add to items at the current stack
+
+if ident increases
+-> create a new level in the stack
+
+if ident decreases
+-> close previous group
+->
+
+    1 Icon
+        1.1 Content
+        1.2 Icon
+        1.3 Icon
+           1.3.1 Icon
+
+        1.4
+
+    2 Icon
+
+    Steps =
+    []
+
+    [ Level [ Item 1. [] ]
+    ]
+
+    [ Level [ Item 1.1 ]
+    , Level [ Item 1. [] ]
+    ]
+
+    [ Level [ Item 1.2, Item 1.1 ]
+    , Level [ Item 1. [] ]
+    ]
+
+    [ Level [ Item 1.3, Item 1.2, Item 1.1 ]
+    , Level [ Item 1. [] ]
+    ]
+
+    [ Level [ Item 1.3.1 ]
+    , Level [ Item 1.3, Item 1.2, Item 1.1 ]
+    , Level [ Item 1. [] ]
+    ]
+
+
+    [ Level [ Item 1.4, Item 1.3([ Item 1.3.1 ]), Item 1.2, Item 1.1 ]
+    , Level [ Item 1. [] ]
+    ]
+
+    [ Level [ Item 2., Item 1. (Level [ Item 1.4, Item 1.3([ Item 1.3.1 ]), Item 1.2, Item 1.1 ]) ]
+    ]
+
+-}
+addItem : Int -> Icon -> List Description -> TreeBuilder -> TreeBuilder
+addItem indentation icon content (TreeBuilder builder) =
+    let
+        newItem : Nested Description
+        newItem =
+            Nested
+                { icon = icon
+                , children = []
+                , content = content
+                }
+    in
+    case builder.levels of
+        [] ->
+            TreeBuilder
+                { previousIndent = indentation
+                , levels =
+                    [ newItem ]
                 }
 
+        lvl :: remaining ->
+            if indentation == 0 then
+                -- add to current level
+                TreeBuilder
+                    { previousIndent = indentation
+                    , levels =
+                        newItem :: lvl :: remaining
+                    }
+
+            else
+                -- We've dedented, so we need to first collapse the current level
+                -- into the one below, then add an item to that level
+                TreeBuilder
+                    { previousIndent = indentation
+                    , levels =
+                        addToLevel
+                            ((abs indentation // 4) - 1)
+                            newItem
+                            lvl
+                            :: remaining
+                    }
+
+
+
+-- indentIndex (Nested nested) =
+--     Nested
+--         { nested
+--             | index = 1 :: nested.index
+--         }
+-- indexTo i (Nested nested) =
+--     case nested.index of
+--         [] ->
+--             Nested { nested | index = [ i ] }
+--         top :: tail ->
+--             Nested { nested | index = i :: tail }
+
+
+addToLevel index brandNewItem (Nested parent) =
+    if index <= 0 then
+        Nested
+            { parent
+                | children =
+                    brandNewItem
+                        :: parent.children
+            }
+
+    else
+        case parent.children of
+            [] ->
+                Nested parent
+
+            top :: remain ->
+                Nested
+                    { parent
+                        | children =
+                            addToLevel (index - 1) brandNewItem top
+                                :: remain
+                    }
+
+
+
+{- NESTED LIST HELPERS -}
+{- Nested Lists -}
+
+
+{-| = indentLevel icon space content
+| indentLevel content
+
+Where the second variation can only occur if the indentation is larger than the previous one.
+
+A list item started with a list icon.
+
+    If indent stays the same
+    -> add to items at the current stack
+
+    if ident increases
+    -> create a new level in the stack
+
+    if ident decreases
+    -> close previous group
+    ->
+
+    <list>
+        <*item>
+            <txt> -> add to head sections
+            <txt> -> add to head sections
+            <item> -> add to head sections
+            <item> -> add to head sections
+                <txt> -> add to content
+                <txt> -> add to content
+                <item> -> add to content
+                <item> -> add to content
+            <item> -> add to content
+
+        <*item>
+        <*item>
+
+    Section
+        [ IconSection
+            { icon = *
+            , sections =
+                [ Text
+                , Text
+                , IconSection Text
+                , IconSection
+                    [ Text
+                    , Text
+                    , item
+                    , item
+                    ]
+                ]
+            }
+        , Icon -> Content
+        , Icon -> Content
+        ]
+
+-}
+type TreeBuilder
+    = TreeBuilder
+        { previousIndent : Int
+        , levels :
+            -- (mostRecent :: remaining)
+            List (Nested Description)
+        }
+
+
+emptyTreeBuilder : TreeBuilder
+emptyTreeBuilder =
+    TreeBuilder
+        { previousIndent = 0
+        , levels = []
+        }
+
+
+renderLevels : List (Nested Description) -> List (Nested Description)
+renderLevels levels =
+    case levels of
+        [] ->
+            []
+
         _ ->
-            nest
+            List.indexedMap
+                (\index level ->
+                    reverseTree { index = index, level = [] } level
+                )
+                levels
+
+
+reverseTree cursor (Nested nest) =
+    Nested
+        { icon = nest.icon
+        , content = List.reverse nest.content
+        , children =
+            List.foldl rev ( dive cursor, [] ) nest.children
+                |> Tuple.second
+        }
+
+
+rev nest ( cursor, found ) =
+    ( next cursor, reverseTree cursor nest :: found )
+
+
+type alias TreeIndex =
+    { index : Int
+    , level : List Int
+    }
+
+
+dive cursor =
+    { cursor
+        | index = 0
+        , level = cursor.index :: cursor.level
+    }
+
+
+next cursor =
+    { cursor
+        | index = cursor.index + 1
+    }

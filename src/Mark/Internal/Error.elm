@@ -368,7 +368,6 @@ render source current =
 
         UnknownBlock expecting ->
             let
-                target : String
                 target =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -394,7 +393,6 @@ render source current =
 
         UnknownInline expecting ->
             let
-                target : String
                 target =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -420,7 +418,6 @@ render source current =
 
         FailMatchOneOf expecting ->
             let
-                target : String
                 target =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -457,7 +454,6 @@ render source current =
 
         CantStartTextWithSpace ->
             let
-                line : String
                 line =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -475,7 +471,6 @@ render source current =
 
         UnclosedStyle styles ->
             let
-                line : String
                 line =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -492,7 +487,6 @@ render source current =
 
         UnexpectedField msgUnexpectedField ->
             let
-                target : String
                 target =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -561,7 +555,6 @@ render source current =
 
         NonMatchingFields fields ->
             let
-                line : String
                 line =
                     String.slice current.range.start.offset current.range.end.offset source
 
@@ -604,7 +597,6 @@ render source current =
 
         MissingFields remaining ->
             let
-                line : String
                 line =
                     String.slice current.range.start.offset current.range.end.offset source
             in
@@ -884,11 +876,9 @@ highlight range source =
     else
         -- multiline
         let
-            snippet : String
             snippet =
                 String.slice range.start.offset range.end.offset source
 
-            indented : String
             indented =
                 String.slice (range.start.offset + 1 - range.start.column) range.start.offset source
 

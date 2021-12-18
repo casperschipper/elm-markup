@@ -1,8 +1,8 @@
 module Mark.Internal.Description exposing
     ( render, compile
-    , Icon(..)
+    , Found(..), Nested(..), Icon(..)
     , Description(..), TextDescription(..), Text(..), Style(..)
-    , Expectation(..), InlineExpectation(..)
+    , Expectation(..), InlineExpectation(..), TreeExpectation(..)
     , Parsed(..), descriptionToString, toString, mergeWith
     , create, createInline
     , Styling, emptyStyles
@@ -10,20 +10,20 @@ module Mark.Internal.Description exposing
     , Uncertain(..), mapSuccessAndRecovered, renderBlock, getBlockExpectation, getParser, getParserNoBar
     , Block(..), BlockKind(..), Document(..)
     , boldStyle, italicStyle, strikeStyle
-    , getId, sizeFromRange
-    , Record(..), Range, recordName, ParseContext(..), blockKindToContext, blockKindToSelection, length, match, matchExpected
-    , BlockOutcome, InlineSelection(..), New(..), NewInline(..), ParsedDetails, createMany, emptyRange, findMany, findMatch, lookup, matchBlock, mergeListWithAttrs, mergeWithAttrs, minusPosition, toNew, toNewText, valid
+    , resultToFound, getId, mapFound, mapNested, textDescriptionRange, getSize, sizeFromRange, minusSize, textSize
+    , Record(..), Range, AnnotationType(..), recordName, ParseContext(..), blockKindToContext, blockKindToSelection, length, match, matchExpected
+    , minusPosition
     )
 
 {-|
 
 @docs render, compile
 
-@docs Icon
+@docs Found, Nested, Icon
 
 @docs Description, TextDescription, Text, Style
 
-@docs Expectation, InlineExpectation
+@docs Expectation, InlineExpectation, TreeExpectation
 
 @docs Parsed, descriptionToString, toString, mergeWith
 
@@ -39,135 +39,45 @@ module Mark.Internal.Description exposing
 
 @docs boldStyle, italicStyle, strikeStyle
 
-@docs resultToDescription, getId, sizeFromRange, foundRange
+@docs resultToFound, getId, mapFound, mapNested, textDescriptionRange, getSize, sizeFromRange, foundRange, minusSize, textSize
 
-@docs Record, Range, recordName, ParseContext, blockKindToContext, blockKindToSelection, length, match, matchExpected
+@docs Record, Range, AnnotationType, recordName, ParseContext, blockKindToContext, blockKindToSelection, length, match, matchExpected
 
 -}
 
 import Mark.Internal.Error as Error
-import Mark.Internal.Format exposing (text)
+import Mark.Internal.Format as Format
 import Mark.Internal.Id as Id exposing (..)
 import Mark.Internal.Outcome exposing (..)
 import Parser.Advanced as Parser exposing ((|.), (|=), Parser)
 
 
 {-| -}
-type Document meta data
+type Document data
     = Document
-        { expect : Expectation
-        , metadata : Parser Error.Context Error.Problem (Result Error.UnexpectedDetails meta)
+        { converter : Parsed -> Outcome Error.AstError (Uncertain data) data
+        , initialSeed : Id.Seed
+        , currentSeed : Id.Seed
+        , expect : Expectation
         , parser : Parser Error.Context Error.Problem Parsed
-        , converter : Parsed -> BlockOutcome ( meta, List data )
         }
-
-
-type alias WithAttr data =
-    { data : data
-    , attrs : List Attribute
-    }
 
 
 {-| -}
 type Parsed
-    = Parsed ParsedDetails
-
-
-type alias ParsedDetails =
-    { errors : List Error.Rendered
-    , found : Description
-    , expected : Expectation
-    , initialSeed : Id.Seed
-    , currentSeed : Id.Seed
-    , attributes : List Attribute
-    }
-
-
-type alias Attribute =
-    { name : String
-    , value : String
-    , block : Id.Id
-    }
-
-
-
-{- SEARCH -}
+    = Parsed
+        { errors : List Error.Rendered
+        , found : Found Description
+        , expected : Expectation
+        , initialSeed : Id.Seed
+        , currentSeed : Id.Seed
+        }
 
 
 {-| -}
-search : String -> String -> Parsed -> List { name : String, value : String, block : Id.Id }
-search name val (Parsed parsed) =
-    []
-
-
-{-| -}
-type Description
-    = DescribeBlock
-        { id : Id
-        , name : String
-        , found : Description
-        }
-    | Record
-        { id : Id
-        , name : String
-        , found : List ( String, Description )
-        }
-    | Group
-        { id : Id
-        , children : List Description
-        }
-    | StartsWith
-        { id : Id
-        , first : Description
-        , second : Description
-        }
-      -- This is an item within a tree
-    | DescribeItem
-        { id : Id
-        , icon : Icon
-        , content : List Description
-        , children : List Description
-        }
-      -- Primitives
-    | DescribeBoolean
-        { id : Id
-        , found : Bool
-        }
-    | DescribeInteger
-        { id : Id
-        , found : Int
-        }
-    | DescribeFloat
-        { id : Id
-        , found : ( String, Float )
-        }
-    | DescribeText
-        { id : Id
-        , text : List TextDescription
-        }
-    | DescribeString Id String
-    | DescribeUnexpected Id Error.UnexpectedDetails
-
-
-type InlineSelection
-    = EmptyAnnotation
-    | SelectText (List Text)
-    | SelectString String
-
-
-{-| -}
-type TextDescription
-    = Styled Text
-    | InlineBlock
-        { kind : InlineSelection
-        , record : Description
-        }
-
-
-{-| A text fragment with some styling.
--}
-type Text
-    = Text Styling String
+type Found item
+    = Found Range item
+    | Unexpected Error.UnexpectedDetails
 
 
 {-| -}
@@ -189,6 +99,40 @@ type alias Range =
 type Icon
     = Bullet
     | AutoNumber Int
+
+
+{-| -}
+type Nested item
+    = Nested
+        { icon : Icon
+        , content : List item
+        , children :
+            List (Nested item)
+        }
+
+
+mapNested : (a -> b) -> Nested a -> Nested b
+mapNested fn (Nested nest) =
+    Nested
+        { icon = nest.icon
+        , content = List.map fn nest.content
+        , children =
+            List.map (mapNested fn) nest.children
+        }
+
+
+{-| With this type, we're not quite sure if we're going to be able to render or not.
+
+Scenarios:
+
+  - A field value of a record has multiple errors with it.
+  - It's caught and the error statue is rendered immediately.
+  - The document can be rendered, but we still have multiple errors to keep track of.
+
+-}
+type Uncertain data
+    = Uncertain ( Error.UnexpectedDetails, List Error.UnexpectedDetails )
+    | Recovered ( Error.UnexpectedDetails, List Error.UnexpectedDetails ) data
 
 
 {-|
@@ -225,28 +169,10 @@ A value is just a raw parser.
 type Block data
     = Block
         { kind : BlockKind
-        , converter : Description -> BlockOutcome data
+        , converter : Description -> Outcome Error.AstError (Uncertain data) data
         , expect : Expectation
         , parser : ParseContext -> Id.Seed -> ( Id.Seed, Parser Error.Context Error.Problem Description )
         }
-
-
-type alias BlockOutcome data =
-    Outcome Error.AstError (Uncertain (WithAttr data)) (WithAttr data)
-
-
-{-| With this type, we're not quite sure if we're going to be able to render or not.
-
-Scenarios:
-
-  - A field value of a record has multiple errors with it.
-  - It's caught and the error statue is rendered immediately.
-  - The document can be rendered, but we still have multiple errors to keep track of.
-
--}
-type Uncertain data
-    = Uncertain ( Error.UnexpectedDetails, List Error.UnexpectedDetails )
-    | Recovered ( Error.UnexpectedDetails, List Error.UnexpectedDetails ) data
 
 
 type ParseContext
@@ -262,7 +188,6 @@ type BlockKind
     | AnnotationNamed String
 
 
-blockKindToContext : BlockKind -> ParseContext
 blockKindToContext kind =
     case kind of
         Value ->
@@ -278,7 +203,6 @@ blockKindToContext kind =
             ParseInline
 
 
-blockKindToSelection : BlockKind -> InlineSelection
 blockKindToSelection kind =
     case kind of
         Value ->
@@ -305,10 +229,97 @@ recordName desc =
 
 
 {-| -}
+type Description
+    = DescribeBlock
+        { id : Id
+        , name : String
+        , found : Found Description
+        , expected : Expectation
+        }
+    | Record
+        { id : Id
+        , name : String
+        , found : Found (List ( String, Found Description ))
+        , expected : Expectation
+        }
+    | OneOf
+        { id : Id
+        , choices : List Expectation
+        , child : Found Description
+        }
+    | ManyOf
+        { id : Id
+        , range : Range
+        , choices : List Expectation
+        , children : List (Found Description)
+        }
+    | StartsWith
+        { range : Range
+        , id : Id
+        , first :
+            { found : Description
+            , expected : Expectation
+            }
+        , second :
+            { found : Description
+            , expected : Expectation
+            }
+        }
+    | DescribeTree
+        { id : Id
+        , range : Range
+        , children : List (Nested Description)
+        , expected : Expectation
+        }
+      -- Primitives
+    | DescribeBoolean
+        { id : Id
+        , found : Found Bool
+        }
+    | DescribeInteger
+        { id : Id
+        , found : Found Int
+        }
+    | DescribeFloat
+        { id : Id
+        , found : Found ( String, Float )
+        }
+    | DescribeText
+        { id : Id
+        , range : Range
+        , text : List TextDescription
+        }
+    | DescribeString Id Range String
+    | DescribeNothing Id
+
+
+type AnnotationType
+    = EmptyAnnotation
+    | SelectText (List Text)
+    | SelectString String
+
+
+{-| -}
+type TextDescription
+    = Styled Range Text
+    | InlineBlock
+        { kind : AnnotationType
+        , range : Range
+        , record : Description
+        }
+
+
+{-| A text fragment with some styling.
+-}
+type Text
+    = Text Styling String
+
+
+{-| -}
 length : TextDescription -> Int
 length inlineEl =
     case inlineEl of
-        Styled txt ->
+        Styled _ txt ->
             textLength txt
 
         InlineBlock details ->
@@ -358,7 +369,17 @@ type Expectation
     | ExpectFloat Float
     | ExpectTextBlock (List InlineExpectation)
     | ExpectString String
-    | ExpectTree Expectation
+    | ExpectTree Expectation (List TreeExpectation)
+    | ExpectNothing
+
+
+{-| -}
+type TreeExpectation
+    = TreeExpectation
+        { icon : Icon
+        , content : List Expectation
+        , children : List TreeExpectation
+        }
 
 
 {-| -}
@@ -366,33 +387,30 @@ type InlineExpectation
     = ExpectText Text
     | ExpectInlineBlock
         { name : String
-        , kind : InlineSelection
+        , kind : AnnotationType
         , fields : List ( String, Expectation )
         }
 
 
 {-| -}
-type New
-    = NewBlock String New
-    | NewRecord String (List ( String, New ))
-    | NewGroup (List New)
-    | NewStartsWith New New
-    | NewBoolean Bool
-    | NewInteger Int
-    | NewFloat Float
-    | NewTextBlock (List NewInline)
-    | NewString String
-    | NewItem Icon (List New)
+mapFound : (a -> b) -> Found a -> Found b
+mapFound fn found =
+    case found of
+        Found range item ->
+            Found range (fn item)
+
+        Unexpected unexp ->
+            Unexpected unexp
 
 
-{-| -}
-type NewInline
-    = NewText Text
-    | NewInlineBlock
-        { name : String
-        , kind : InlineSelection
-        , fields : List ( String, New )
-        }
+getFoundSize : Found a -> Range
+getFoundSize found =
+    case found of
+        Found range _ ->
+            range
+
+        Unexpected unexp ->
+            unexp.range
 
 
 {-| -}
@@ -403,26 +421,18 @@ uncertain err =
 
 mapSuccessAndRecovered :
     (success -> otherSuccess)
-    -> BlockOutcome success
-    -> BlockOutcome otherSuccess
+    -> Outcome f (Uncertain success) success
+    -> Outcome f (Uncertain otherSuccess) otherSuccess
 mapSuccessAndRecovered fn outcome =
     case outcome of
         Success s ->
-            Success
-                { data = fn s.data
-                , attrs = s.attrs
-                }
+            Success (fn s)
 
         Almost (Uncertain u) ->
             Almost (Uncertain u)
 
         Almost (Recovered e a) ->
-            Almost
-                (Recovered e
-                    { data = fn a.data
-                    , attrs = a.attrs
-                    }
-                )
+            Almost (Recovered e (fn a))
 
         Failure f ->
             Failure f
@@ -436,20 +446,20 @@ type Record data
         , expectations : List ( String, Expectation )
         , fieldConverter :
             Description
-            -> InlineSelection
-            -> BlockOutcome (FieldConverter data)
+            -> AnnotationType
+            -> Outcome Error.AstError (Uncertain (FieldConverter data)) (FieldConverter data)
         , fields : List FieldParser
         }
 
 
 type alias FieldConverter data =
-    ( List ( String, Description ), data )
+    ( Range, List ( String, Found Description ), data )
 
 
 type alias FieldParser =
     ParseContext
     -> Id.Seed
-    -> ( Id.Seed, ( String, Parser Error.Context Error.Problem ( String, Description ) ) )
+    -> ( Id.Seed, ( String, Parser Error.Context Error.Problem ( String, Found Description ) ) )
 
 
 emptyRange =
@@ -475,13 +485,16 @@ getId description =
         Record details ->
             details.id
 
-        Group details ->
+        OneOf details ->
+            details.id
+
+        ManyOf details ->
             details.id
 
         StartsWith details ->
             details.id
 
-        DescribeItem details ->
+        DescribeTree details ->
             details.id
 
         DescribeBoolean details ->
@@ -496,11 +509,80 @@ getId description =
         DescribeText details ->
             details.id
 
-        DescribeString id _ ->
+        DescribeString id _ _ ->
             id
 
-        DescribeUnexpected id details ->
-            Id.Id "never" []
+        DescribeNothing id ->
+            id
+
+
+minusSize :
+    { offset : Int, line : Int }
+    -> { offset : Int, line : Int }
+    -> { offset : Int, line : Int }
+minusSize one two =
+    { offset = one.offset - two.offset
+    , line = one.line - two.line
+    }
+
+
+textSize : List TextDescription -> { offset : Int, line : Int }
+textSize els =
+    case els of
+        [] ->
+            { offset = 0, line = 0 }
+
+        start :: remain ->
+            case List.head (List.reverse remain) of
+                Nothing ->
+                    sizeFromRange (textDescriptionRange start)
+
+                Just last ->
+                    minusSize
+                        (sizeFromRange (textDescriptionRange start))
+                        (sizeFromRange (textDescriptionRange last))
+
+
+getSize : Description -> { offset : Int, line : Int }
+getSize description =
+    case description of
+        DescribeBlock details ->
+            sizeFromRange (getFoundSize details.found)
+
+        Record details ->
+            sizeFromRange (getFoundSize details.found)
+
+        OneOf details ->
+            sizeFromRange (getFoundSize details.child)
+
+        ManyOf details ->
+            sizeFromRange details.range
+
+        StartsWith details ->
+            sizeFromRange details.range
+
+        DescribeTree details ->
+            sizeFromRange details.range
+
+        DescribeBoolean details ->
+            sizeFromRange (getFoundSize details.found)
+
+        DescribeInteger details ->
+            sizeFromRange (getFoundSize details.found)
+
+        DescribeFloat details ->
+            sizeFromRange (getFoundSize details.found)
+
+        DescribeText details ->
+            sizeFromRange details.range
+
+        DescribeString _ range _ ->
+            sizeFromRange range
+
+        DescribeNothing id ->
+            { offset = 0
+            , line = 0
+            }
 
 
 sizeFromRange range =
@@ -509,16 +591,21 @@ sizeFromRange range =
     }
 
 
-renderBlock : Block data -> Description -> BlockOutcome data
-renderBlock fromBlock description =
-    case description of
-        DescribeUnexpected id unexpected ->
-            uncertain unexpected
+textDescriptionRange : TextDescription -> Range
+textDescriptionRange textDesc =
+    case textDesc of
+        Styled rng _ ->
+            rng
 
-        _ ->
-            case fromBlock of
-                Block { converter } ->
-                    converter description
+        InlineBlock details ->
+            details.range
+
+
+renderBlock : Block data -> Description -> Outcome Error.AstError (Uncertain data) data
+renderBlock fromBlock =
+    case fromBlock of
+        Block { converter } ->
+            converter
 
 
 getBlockExpectation fromBlock =
@@ -543,47 +630,41 @@ blockName (Block details) =
             Just name
 
 
-getPosition : Parser c p Position
-getPosition =
-    Parser.succeed
-        (\offset ( row, col ) ->
-            { offset = offset
-            , line = row
-            , column = col
-            }
-        )
-        |= Parser.getOffset
-        |= Parser.getPosition
-
-
 getParser : ParseContext -> Id.Seed -> Block data -> ( Id.Seed, Parser Error.Context Error.Problem Description )
 getParser context seed (Block details) =
     case details.kind of
         Named name ->
-            case context of
-                ParseInline ->
+            let
+                ( newSeed, blockParser ) =
                     details.parser context seed
-
-                _ ->
-                    let
-                        ( newSeed, blockParser ) =
-                            details.parser context seed
-                    in
-                    ( newSeed
-                    , Parser.succeed identity
-                        |. Parser.token (Parser.Token "|>" (Error.ExpectingBlockName name))
-                        |. Parser.chompWhile (\c -> c == ' ')
-                        |= blockParser
-                    )
+            in
+            ( newSeed
+            , Parser.succeed identity
+                |. Parser.token (Parser.Token "|>" (Error.ExpectingBlockName name))
+                |. Parser.chompWhile (\c -> c == ' ')
+                |= blockParser
+            )
 
         Value ->
             details.parser context seed
 
         VerbatimNamed name ->
-            details.parser context seed
+            let
+                ( newSeed, blockParser ) =
+                    details.parser context seed
+            in
+            ( newSeed
+            , blockParser
+            )
 
         AnnotationNamed name ->
-            details.parser context seed
+            let
+                ( newSeed, blockParser ) =
+                    details.parser context seed
+            in
+            ( newSeed
+            , blockParser
+            )
 
 
 getParserNoBar : ParseContext -> Id.Seed -> Block data -> ( Id.Seed, Parser Error.Context Error.Problem Description )
@@ -630,77 +711,9 @@ strikeStyle =
     }
 
 
-inlineExample : InlineSelection -> Block a -> Maybe String
-inlineExample selection (Block details) =
+inlineExample : AnnotationType -> Block a -> String
+inlineExample kind (Block block) =
     let
-        selectionText : String
-        selectionText =
-            selectionContentToString selection
-    in
-    case details.kind of
-        VerbatimNamed name ->
-            Just
-                ("`" ++ selectionText ++ "`" ++ inlineAttributeExample details.expect)
-
-        AnnotationNamed name ->
-            Just
-                ("[" ++ selectionText ++ "]" ++ inlineAttributeExample details.expect)
-
-        _ ->
-            Just selectionText
-
-
-inlineAttributeExample : Expectation -> String
-inlineAttributeExample exp =
-    case exp of
-        ExpectRecord name attrs ->
-            "{"
-                ++ name
-                ++ inlineFieldExample attrs
-                ++ "}"
-
-        _ ->
-            ""
-
-
-inlineFieldExample attrs =
-    case attrs of
-        [] ->
-            ""
-
-        _ ->
-            "| "
-                ++ (List.map
-                        (\( fieldName, valueExpected ) ->
-                            fieldName ++ " = " ++ humanReadableExpectations valueExpected
-                        )
-                        attrs
-                        |> String.join ", "
-                        |> (\x -> x ++ " ")
-                   )
-
-
-selectionContentToString : InlineSelection -> String
-selectionContentToString selection =
-    case selection of
-        EmptyAnnotation ->
-            ""
-
-        SelectText texts ->
-            let
-                ( newStyles, renderedText ) =
-                    textListToString texts emptyStyles
-            in
-            renderedText
-
-        SelectString str ->
-            str
-
-
-inlineExampleHelper : InlineSelection -> Block a -> String
-inlineExampleHelper kind (Block block) =
-    let
-        containerAsString : String
         containerAsString =
             case block.expect of
                 ExpectRecord name [] ->
@@ -719,7 +732,6 @@ inlineExampleHelper kind (Block block) =
         renderField ( name, contentBlock ) =
             name ++ " = " ++ "value"
 
-        selection : String
         selection =
             case kind of
                 EmptyAnnotation ->
@@ -751,326 +763,89 @@ inlineExampleHelper kind (Block block) =
             "[" ++ selection ++ "]" ++ containerAsString
 
 
-findMatch description blcks =
-    case blcks of
-        [] ->
-            Failure Error.NoMatch
-
-        blck :: remain ->
-            if matchBlock description blck then
-                renderBlock blck description
-
-            else
-                findMatch description remain
-
-
-matchBlock : Description -> Block a -> Bool
-matchBlock desc (Block details) =
-    match desc details.expect
-
-
-valid : New -> Expectation -> Bool
-valid new exp =
-    case exp of
-        ExpectOneOf choices ->
-            List.any
-                (valid new)
-                choices
-
-        _ ->
-            case new of
-                NewBlock name child ->
-                    case exp of
-                        ExpectBlock expectedName expectedChild ->
-                            if expectedName == name then
-                                valid child expectedChild
-
-                            else
-                                False
-
-                        _ ->
-                            False
-
-                NewRecord name fields ->
-                    case exp of
-                        ExpectRecord expectedName expectedFields ->
-                            if name == expectedName then
-                                List.all (validFields expectedFields) fields
-
-                            else
-                                False
-
-                        _ ->
-                            False
-
-                NewGroup children ->
-                    case exp of
-                        ExpectManyOf choices ->
-                            List.all
-                                (\child ->
-                                    List.any (valid child) choices
-                                )
-                                children
-
-                        _ ->
-                            False
-
-                NewStartsWith one two ->
-                    case exp of
-                        ExpectStartsWith startExp endExp ->
-                            valid one startExp
-                                && valid two endExp
-
-                        _ ->
-                            False
-
-                NewItem icon children ->
-                    List.all
-                        (\content ->
-                            valid content exp
-                        )
-                        children
-
-                NewBoolean foundBoolean ->
-                    case exp of
-                        ExpectBoolean _ ->
-                            True
-
-                        _ ->
-                            False
-
-                NewInteger _ ->
-                    case exp of
-                        ExpectInteger _ ->
-                            True
-
-                        _ ->
-                            False
-
-                NewFloat _ ->
-                    case exp of
-                        ExpectFloat _ ->
-                            True
-
-                        _ ->
-                            False
-
-                NewTextBlock inlines ->
-                    case exp of
-                        ExpectTextBlock expectedInlines ->
-                            List.all (validInline expectedInlines) inlines
-
-                        _ ->
-                            False
-
-                NewString _ ->
-                    case exp of
-                        ExpectString _ ->
-                            True
-
-                        _ ->
-                            False
-
-
-validInline : List InlineExpectation -> NewInline -> Bool
-validInline expectations new =
-    case new of
-        NewText _ ->
-            True
-
-        NewInlineBlock details ->
-            List.any
-                (\exp ->
-                    case exp of
-                        ExpectInlineBlock expected ->
-                            if
-                                (details.name == expected.name)
-                                    && validKind expected.kind details.kind
-                            then
-                                List.all (validFields expected.fields) details.fields
-
-                            else
-                                False
-
-                        _ ->
-                            False
-                )
-                expectations
-
-
-validKind : InlineSelection -> InlineSelection -> Bool
-validKind one two =
-    case one of
-        EmptyAnnotation ->
-            case two of
-                EmptyAnnotation ->
-                    True
-
-                _ ->
-                    False
-
-        SelectText _ ->
-            case two of
-                SelectText _ ->
-                    True
-
-                _ ->
-                    False
-
-        SelectString _ ->
-            case two of
-                SelectString _ ->
-                    True
-
-                _ ->
-                    False
-
-
-validFields : List ( String, Expectation ) -> ( String, New ) -> Bool
-validFields expectedFields ( targetFieldName, new ) =
-    let
-        innerMatch ( validFieldName, validExpectation ) =
-            (validFieldName == targetFieldName)
-                && valid new validExpectation
-    in
-    List.any innerMatch expectedFields
-
-
 match : Description -> Expectation -> Bool
 match description exp =
-    case exp of
-        ExpectOneOf choices ->
-            case description of
-                DescribeUnexpected _ details ->
-                    -- This is sorta weird but correct
-                    -- If we're in a manyOf or oneOf, the error we want to report is this specific one
-                    -- not the general "didn't match" error
+    case description of
+        DescribeNothing _ ->
+            case exp of
+                ExpectNothing ->
                     True
 
                 _ ->
-                    List.any
-                        (match description)
-                        choices
+                    False
 
-        _ ->
-            case description of
-                DescribeUnexpected _ details ->
-                    -- Not totally sure if this is right :/
+        DescribeBlock details ->
+            case exp of
+                ExpectBlock expectedName expectedChild ->
+                    if expectedName == details.name then
+                        matchExpected details.expected expectedChild
+
+                    else
+                        False
+
+                _ ->
+                    False
+
+        Record details ->
+            matchExpected details.expected exp
+
+        OneOf one ->
+            matchExpected (ExpectOneOf one.choices) exp
+
+        ManyOf many ->
+            matchExpected (ExpectManyOf many.choices) exp
+
+        StartsWith details ->
+            case exp of
+                ExpectStartsWith startExp endExp ->
+                    match details.first.found startExp
+                        && match details.second.found endExp
+
+                _ ->
+                    False
+
+        DescribeTree tree ->
+            matchExpected tree.expected exp
+
+        DescribeBoolean foundBoolean ->
+            case exp of
+                ExpectBoolean _ ->
                     True
 
-                DescribeBlock details ->
-                    case exp of
-                        ExpectBlock expectedName expectedChild ->
-                            if expectedName == details.name then
-                                match details.found expectedChild
+                _ ->
+                    False
 
-                            else
-                                False
+        DescribeInteger _ ->
+            case exp of
+                ExpectInteger _ ->
+                    True
 
-                        _ ->
-                            False
+                _ ->
+                    False
 
-                Record record ->
-                    case exp of
-                        ExpectRecord name fields ->
-                            if record.name == name then
-                                List.all (matchExpectedFields fields) record.found
+        DescribeFloat _ ->
+            case exp of
+                ExpectFloat _ ->
+                    True
 
-                            else
-                                False
+                _ ->
+                    False
 
-                        _ ->
-                            False
+        DescribeText _ ->
+            case exp of
+                ExpectTextBlock _ ->
+                    True
 
-                Group many ->
-                    case exp of
-                        ExpectManyOf choices ->
-                            List.all
-                                (\child ->
-                                    List.any (match child) choices
-                                )
-                                many.children
+                _ ->
+                    False
 
-                        ExpectTree itemExpectation ->
-                            List.all
-                                (\child ->
-                                    match child itemExpectation
-                                )
-                                many.children
+        DescribeString _ _ _ ->
+            case exp of
+                ExpectString _ ->
+                    True
 
-                        _ ->
-                            False
-
-                StartsWith details ->
-                    case exp of
-                        ExpectStartsWith startExp endExp ->
-                            match details.first startExp
-                                && match details.second endExp
-
-                        _ ->
-                            False
-
-                DescribeItem item ->
-                    List.all
-                        (\content ->
-                            match content exp
-                        )
-                        item.content
-                        && List.all
-                            (\content ->
-                                match content exp
-                            )
-                            item.children
-
-                DescribeBoolean foundBoolean ->
-                    case exp of
-                        ExpectBoolean _ ->
-                            True
-
-                        _ ->
-                            False
-
-                DescribeInteger _ ->
-                    case exp of
-                        ExpectInteger _ ->
-                            True
-
-                        _ ->
-                            False
-
-                DescribeFloat _ ->
-                    case exp of
-                        ExpectFloat _ ->
-                            True
-
-                        _ ->
-                            False
-
-                DescribeText _ ->
-                    case exp of
-                        ExpectTextBlock _ ->
-                            True
-
-                        _ ->
-                            False
-
-                DescribeString _ _ ->
-                    case exp of
-                        ExpectString _ ->
-                            True
-
-                        _ ->
-                            False
-
-
-matchExpectedFields : List ( String, Expectation ) -> ( String, Description ) -> Bool
-matchExpectedFields fields ( targetFieldName, description ) =
-    let
-        innerMatch ( validFieldName, validExpectation ) =
-            (validFieldName == targetFieldName)
-                && match description validExpectation
-    in
-    List.any innerMatch fields
+                _ ->
+                    False
 
 
 {-| Is the first expectation a subset of the second?
@@ -1109,7 +884,7 @@ matchExpected subExp expected =
         ( ExpectString _, ExpectString _ ) ->
             True
 
-        ( ExpectTree _, ExpectTree _ ) ->
+        ( ExpectTree oneContent _, ExpectTree twoContent _ ) ->
             True
 
         _ ->
@@ -1122,14 +897,14 @@ matchExpectedOptions opts target =
 
 
 matchFields : List ( String, Expectation ) -> ( String, Expectation ) -> Bool
-matchFields expected ( targetFieldName, targetFieldExpectation ) =
+matchFields valid ( targetFieldName, targetFieldExpectation ) =
     let
         innerMatch ( validFieldName, validExpectation ) =
             validFieldName
                 == targetFieldName
                 && matchExpected validExpectation targetFieldExpectation
     in
-    List.any innerMatch expected
+    List.any innerMatch valid
 
 
 boolToString : Bool -> String
@@ -1179,7 +954,7 @@ minusPosition end start =
 {-| -}
 toString : Parsed -> String
 toString (Parsed parsed) =
-    writeDescription
+    writeFound writeDescription
         parsed.found
         { indent = 0
         , position = { line = 1, column = 1, offset = 0 }
@@ -1293,140 +1068,75 @@ dedent cursor =
     { cursor | indent = max 0 cursor.indent - 1 }
 
 
-writeIndent : PrintCursor -> PrintCursor
-writeIndent cursor =
-    cursor
-        |> write (String.repeat (cursor.indent * 4) " ")
-
-
 writeIcon icon cursor =
     case icon of
         Bullet ->
             cursor
-                |> write "--"
+                |> write "-"
 
         AutoNumber i ->
             cursor
                 |> write (String.fromInt i ++ ".")
 
 
-writeGroup : List Description -> PrintCursor -> PrintCursor
-writeGroup group cursor =
-    case group of
-        [] ->
-            cursor
-
-        top :: [] ->
-            cursor
-                |> writeIndent
-                |> writeDescription top
-
-        top :: remain ->
-            let
-                compact : Bool
-                compact =
-                    case top of
-                        DescribeItem _ ->
-                            True
-
-                        _ ->
-                            False
-
-                writtenDescription : PrintCursor
-                writtenDescription =
-                    writeDescription top
-                        { indent = cursor.indent
-                        , position = cursor.position
-                        , printed = ""
-                        }
-
-                lines =
-                    writtenDescription.printed
-                        |> String.lines
-                        |> List.length
-
-                newCursor =
-                    cursor
-                        |> writeIndent
-                        |> write writtenDescription.printed
-                        |> write
-                            (if lines > 1 then
-                                "\n\n"
-
-                             else if compact then
-                                "\n"
-
-                             else
-                                "\n\n"
-                            )
-            in
-            writeGroup remain newCursor
-
-
-isGroup : Description -> Bool
-isGroup desc =
-    case desc of
-        Group _ ->
-            True
-
-        _ ->
-            False
-
-
 {-| -}
 writeDescription : Description -> PrintCursor -> PrintCursor
 writeDescription description cursor =
     case description of
-        DescribeUnexpected _ details ->
-            -- TODO: What do we expect here?
+        DescribeNothing _ ->
             cursor
 
         DescribeBlock details ->
             cursor
-                |> write ("|> " ++ details.name ++ "\n")
+                |> write ("|> " ++ details.name)
                 |> indent
-                -- we have this exception because groups are containers
-                -- but do NOT have a containing block to handle indentation
-                |> (if isGroup details.found then
-                        identity
-
-                    else
-                        writeIndent
-                   )
-                |> writeDescription details.found
+                |> writeFound writeDescription details.found
                 |> dedent
 
         Record details ->
             cursor
-                |> write ("|> " ++ details.name ++ "\n")
-                |> indent
-                |> (\c ->
-                        List.foldr writeField
-                            c
-                            details.found
-                   )
+                |> writeFound
+                    (\fields curs ->
+                        curs
+                            -- TODO: This seems to be necessary for the recordOfRecord test, but
+                            -- makes things parsed normally fail...sooo
+                            -- |> writeIndent
+                            |> write ("|> " ++ details.name)
+                            |> indent
+                            |> (\c ->
+                                    List.foldr writeField c fields
+                               )
+                    )
+                    details.found
                 |> dedent
 
-        Group many ->
-            writeGroup many.children cursor
+        OneOf one ->
+            cursor
+                |> writeFound writeDescription one.child
+
+        ManyOf many ->
+            List.foldl
+                (writeFound writeDescription)
+                cursor
+                many.children
 
         StartsWith details ->
             cursor
-                |> writeDescription details.first
-                |> write "\n"
-                |> writeDescription details.second
+                |> writeDescription details.first.found
+                |> writeDescription details.second.found
 
         DescribeBoolean details ->
-            writeWith boolToString details.found cursor
+            writeFound (writeWith boolToString) details.found cursor
 
         DescribeInteger details ->
-            writeWith String.fromInt details.found cursor
+            writeFound (writeWith String.fromInt) details.found cursor
 
         DescribeFloat details ->
-            writeWith Tuple.first details.found cursor
+            writeFound (writeWith Tuple.first) details.found cursor
 
         DescribeText txt ->
             cursor
+                |> advanceTo txt.range
                 |> (\c ->
                         txt.text
                             |> List.foldl
@@ -1435,11 +1145,11 @@ writeDescription description cursor =
                                 , styles = emptyStyles
                                 }
                             |> writeTextDescription
-                                (Styled (Text emptyStyles ""))
+                                (Styled emptyRange (Text emptyStyles ""))
                             |> .cursor
                    )
 
-        DescribeString id str ->
+        DescribeString id range str ->
             let
                 indented =
                     String.lines str
@@ -1452,11 +1162,11 @@ writeDescription description cursor =
                                     String.repeat (cursor.indent * 4) " " ++ s
                             )
 
-                numLines : Int
                 numLines =
                     List.length indented
             in
             cursor
+                |> advanceTo range
                 |> (\curs ->
                         List.foldl
                             (\line ( i, advancedCurs ) ->
@@ -1471,68 +1181,57 @@ writeDescription description cursor =
                    )
                 |> Tuple.second
 
-        DescribeItem item ->
+        DescribeTree tree ->
             cursor
-                |> writeIcon item.icon
-                |> write " "
-                |> indent
-                |> (\curs ->
-                        case item.content of
-                            [] ->
-                                curs
+                |> advanceTo tree.range
+                |> (\curs -> List.foldl writeNested curs tree.children)
 
-                            first :: [] ->
-                                curs
-                                    |> writeDescription first
 
-                            first :: remain ->
-                                curs
-                                    |> writeDescription first
-                                    |> write "\n\n"
-                                    |> writeGroup remain
-                                    |> write "\n"
-                   )
-                |> (\curs ->
-                        case item.children of
-                            [] ->
-                                curs
-
-                            _ ->
-                                curs
-                                    |> write "\n"
-                                    |> writeGroup item.children
-                   )
-                |> dedent
+writeNested (Nested node) cursor =
+    cursor
+        |> writeIcon node.icon
+        |> (\curs -> List.foldl writeDescription curs node.content)
+        |> indent
+        |> (\curs -> List.foldl writeNested curs node.children)
+        |> dedent
 
 
 textDescriptionToString existingStyles txt =
     case txt of
-        Styled t ->
+        Styled range t ->
             textToString existingStyles t
 
         InlineBlock details ->
             let
-                renderField ( name, desc ) =
+                renderField ( name, foundDesc ) =
                     name
                         ++ " = "
-                        ++ descriptionToString desc
+                        ++ (case foundDesc of
+                                Found _ desc ->
+                                    descriptionToString desc
 
-                inlineRecord : String
+                                _ ->
+                                    ""
+                           )
+
                 inlineRecord =
                     case details.record of
                         Record recordDetails ->
                             case recordDetails.found of
-                                [] ->
+                                Found _ [] ->
                                     "{"
                                         ++ recordDetails.name
                                         ++ "}"
 
-                                fields ->
+                                Found _ fields ->
                                     "{"
                                         ++ recordDetails.name
                                         ++ "|"
                                         ++ String.join ", " (List.map renderField fields)
                                         ++ "}"
+
+                                Unexpected _ ->
+                                    ""
 
                         _ ->
                             ""
@@ -1545,7 +1244,9 @@ textDescriptionToString existingStyles txt =
                 SelectText txts ->
                     let
                         ( newStyles, renderedText ) =
-                            textListToString txts existingStyles
+                            txts
+                                |> List.foldl gatherText ( existingStyles, "" )
+                                |> gatherText (Text emptyStyles "")
                     in
                     ( newStyles
                     , "[" ++ renderedText ++ "]" ++ inlineRecord
@@ -1556,10 +1257,16 @@ textDescriptionToString existingStyles txt =
                         ("`" ++ str ++ "`" ++ inlineRecord)
 
 
-textListToString txts existingStyles =
-    txts
-        |> List.foldl gatherText ( existingStyles, "" )
-        |> gatherText (Text emptyStyles "")
+
+-- inlineDescToString : InlineAttribute -> String
+-- inlineDescToString inlineDesc =
+--     case inlineDesc of
+--         AttrString { name, range, value } ->
+--             name ++ " = " ++ value
+--         AttrFloat { name, range, value } ->
+--             name ++ " = " ++ Tuple.first value
+--         AttrInt { name, range, value } ->
+--             name ++ " = " ++ String.fromInt value
 
 
 writeTextDescription desc cursorAndStyles =
@@ -1567,19 +1274,14 @@ writeTextDescription desc cursorAndStyles =
         ( newStyles, newStr ) =
             textDescriptionToString cursorAndStyles.styles desc
     in
-    { cursor =
-        if cursorAndStyles.cursor.indent > 0 then
-            write
-                (String.replace "\n"
-                    ("\n" ++ String.repeat (4 * cursorAndStyles.cursor.indent) " ")
-                    newStr
-                )
-                cursorAndStyles.cursor
-
-        else
-            write newStr cursorAndStyles.cursor
+    { cursor = write newStr cursorAndStyles.cursor
     , styles = newStyles
     }
+
+
+
+-- writeTextNode node curs =
+--     write (textToString node) curs
 
 
 textToString : Styling -> Text -> ( Styling, String )
@@ -1596,7 +1298,6 @@ gatherText (Text styles txt) ( existingStyles, existingStr ) =
 -}
 startingCharacters one two =
     let
-        boldClosing : String
         boldClosing =
             if one.bold && not two.bold then
                 "*"
@@ -1604,7 +1305,6 @@ startingCharacters one two =
             else
                 ""
 
-        boldOpening : String
         boldOpening =
             if not one.bold && two.bold then
                 "*"
@@ -1612,7 +1312,6 @@ startingCharacters one two =
             else
                 ""
 
-        italicClosing : String
         italicClosing =
             if one.italic && not two.italic then
                 "/"
@@ -1620,7 +1319,6 @@ startingCharacters one two =
             else
                 ""
 
-        italicOpening : String
         italicOpening =
             if not one.italic && two.italic then
                 "/"
@@ -1628,7 +1326,6 @@ startingCharacters one two =
             else
                 ""
 
-        strikeClosing : String
         strikeClosing =
             if one.strike && not two.strike then
                 "~"
@@ -1636,7 +1333,6 @@ startingCharacters one two =
             else
                 ""
 
-        strikeOpening : String
         strikeOpening =
             if not one.strike && two.strike then
                 "~"
@@ -1656,61 +1352,31 @@ writeWith toStr a cursor =
     write (toStr a) cursor
 
 
-writeField : ( String, Description ) -> PrintCursor -> PrintCursor
-writeField ( name, description ) cursor =
-    let
-        writtenDescription =
-            { indent = cursor.indent
-            , position = cursor.position
-            , printed = ""
-            }
-                |> indent
-                |> writeDescription description
+writeFound : (a -> PrintCursor -> PrintCursor) -> Found a -> PrintCursor -> PrintCursor
+writeFound fn found cursor =
+    case found of
+        Found range fnd ->
+            cursor
+                |> advanceTo range
+                |> fn fnd
 
-        lines : Int
-        lines =
-            List.length (String.lines writtenDescription.printed)
-    in
-    cursor
-        |> writeIndent
-        |> write
-            (name ++ " =")
-        |> indent
-        |> (\curs ->
-                if isGroup description then
-                    curs
-                        |> write "\n"
-
-                else if lines > 1 then
-                    curs
-                        |> write "\n"
-                        |> writeIndent
-
-                else
-                    curs
-                        |> write " "
-           )
-        |> write writtenDescription.printed
-        |> (\c ->
-                if String.endsWith "\n" c.printed then
-                    c
-
-                else
-                    c |> write "\n"
-           )
-        |> dedent
+        Unexpected unexpected ->
+            cursor
+                |> advanceTo unexpected.range
 
 
-indentIfMultiline : Bool -> PrintCursor -> PrintCursor
-indentIfMultiline isMultiline cursor =
-    if isMultiline then
-        cursor
-            |> write "\n"
-            |> writeIndent
+writeField : ( String, Found Description ) -> PrintCursor -> PrintCursor
+writeField ( name, foundVal ) cursor =
+    case foundVal of
+        Found rng fnd ->
+            cursor
+                |> advanceTo rng
+                |> write (name ++ " =")
+                |> writeDescription fnd
 
-    else
-        cursor
-            |> write " "
+        Unexpected unexpected ->
+            cursor
+                |> advanceTo unexpected.range
 
 
 
@@ -1718,21 +1384,27 @@ indentIfMultiline isMultiline cursor =
 
 
 createInline :
-    List NewInline
-    -> List TextDescription
-createInline current =
-    List.foldl newInlineToText
-        { text = []
+    Position
+    -> List InlineExpectation
+    -> ( Position, List TextDescription )
+createInline start current =
+    List.foldl inlineExpectationToDesc
+        { position = start
+        , text = []
         , styling = emptyStyles
         }
         current
-        |> .text
-        |> List.reverse
+        |> (\cursor ->
+                ( moveColumn
+                    (numberStyleChanges emptyStyles cursor.styling)
+                    cursor.position
+                , List.reverse cursor.text
+                )
+           )
 
 
 numberStyleChanges one two =
     let
-        boldNum : number
         boldNum =
             if one.bold /= two.bold then
                 1
@@ -1740,7 +1412,6 @@ numberStyleChanges one two =
             else
                 0
 
-        italicNum : number
         italicNum =
             if one.italic /= two.italic then
                 1
@@ -1748,7 +1419,6 @@ numberStyleChanges one two =
             else
                 0
 
-        strikeNum : number
         strikeNum =
             if one.strike /= two.strike then
                 1
@@ -1774,377 +1444,622 @@ moveText (Text styling str) existingStyling cursor =
         |> moveNewlines numberLines
 
 
-newInlineToText new cursor =
-    case new of
-        NewText ((Text newStyling str) as txt) ->
-            { text =
-                Styled txt :: cursor.text
+inlineExpectationToDesc exp cursor =
+    case exp of
+        ExpectText ((Text newStyling str) as txt) ->
+            let
+                end =
+                    moveText txt cursor.styling cursor.position
+            in
+            { position = end
+            , text =
+                Styled
+                    { start = cursor.position
+                    , end = end
+                    }
+                    txt
+                    :: cursor.text
             , styling = newStyling
             }
 
-        NewInlineBlock details ->
-            { styling = cursor.styling
+        ExpectInlineBlock details ->
+            let
+                end =
+                    cursor.position
+
+                -- |> moveColumn (String.length name + 5)
+                -- |> moveColumn (attributesLength attrs)
+                -- TODO: Change position!
+            in
+            { position = end
+            , styling = cursor.styling
             , text =
                 InlineBlock
                     { kind = details.kind
+                    , range =
+                        { start = cursor.position
+                        , end = end
+                        }
                     , record =
-                        -- TODO: Thread ids through here!!
-                        Record
-                            { id = Id.Id "" []
-                            , name = details.name
-                            , found =
-                                List.map
-                                    (Tuple.mapSecond (.desc << create (Id.initialSeed "")))
-                                    details.fields
-                            }
+                        DescribeNothing (Tuple.first (Id.step Id.initialSeed))
+
+                    -- TODO: MAKE CONVERSION TO DESCRIPTION!
+                    -- List.map expectationToAttr attrs
                     }
                     :: cursor.text
             }
 
 
-toNew : Description -> New
-toNew desc =
-    case desc of
-        DescribeBlock details ->
-            NewBlock details.name (toNew details.found)
+{-|
 
-        Record details ->
-            NewRecord details.name
-                (List.map (Tuple.mapSecond toNew) details.found)
+    `Position` is the starting position for a block.
 
-        Group details ->
-            NewGroup (List.map toNew details.children)
+    The same rules for indentation as they apply everywhere.
 
-        StartsWith details ->
-            NewStartsWith
-                (toNew details.first)
-                (toNew details.second)
-
-        DescribeItem details ->
-            NewItem details.icon
-                (List.map toNew details.children)
-
-        -- Primitives
-        DescribeBoolean details ->
-            NewBoolean details.found
-
-        DescribeInteger details ->
-            NewInteger details.found
-
-        DescribeFloat details ->
-            NewFloat (Tuple.second details.found)
-
-        DescribeText details ->
-            NewTextBlock (List.map toNewText details.text)
-
-        DescribeString id str ->
-            NewString str
-
-        DescribeUnexpected id err ->
-            NewString ""
-
-
-toNewText : TextDescription -> NewInline
-toNewText textDesc =
-    case textDesc of
-        Styled text ->
-            NewText text
-
-        InlineBlock details ->
-            case details.record of
-                Record rec ->
-                    NewInlineBlock
-                        { name = rec.name
-                        , kind = details.kind
-                        , fields =
-                            List.map (Tuple.mapSecond toNew) rec.found
-                        }
-
-                _ ->
-                    -- NOTE, we need to maketext descriptions closer
-                    -- to the `NewInlineBlock` modeling
-                    NewInlineBlock
-                        { name = "INCORRECT"
-                        , kind = details.kind
-                        , fields = []
-                        }
-
-
-{-| NOTE, this returns items in reversed order!
--}
-createMany :
-    Id.Seed
-    -> List New
-    ->
-        { new : List Description
-        , seed : Id.Seed
-        }
-createMany seed manyNew =
-    createManyHelper seed manyNew []
-
-
-createManyHelper :
-    Id.Seed
-    -> List New
-    -> List Description
-    ->
-        { new : List Description
-        , seed : Id.Seed
-        }
-createManyHelper seed manyNew existing =
-    case manyNew of
-        [] ->
-            { new = List.reverse existing
-            , seed = seed
-            }
-
-        top :: remaining ->
-            let
-                created =
-                    create seed top
-            in
-            createManyHelper created.seed remaining (created.desc :: existing)
-
-
-{-| This function does no validation, it only creates a new Description.
-
-    `
+        - Primitives do not handle their indentation.
+        - Block, Record, and Tree elements handle the indentation of their children.
 
 -}
 create :
-    Id.Seed
-    -> New
+    { seed : Id.Seed
+    , indent : Int
+    , base : Position
+    , expectation : Expectation
+    }
     ->
-        { desc : Description
+        { pos : Position
+        , desc : Description
         , seed : Id.Seed
         }
-create seed new =
-    case new of
-        NewBlock name child ->
+create current =
+    case current.expectation of
+        ExpectBlock name childExpectation ->
             let
-                ( blockId, newSeed ) =
-                    Id.step seed
+                new =
+                    create
+                        { indent = current.indent + 1
+                        , base =
+                            current.base
+                                |> moveNewline
+                                |> moveColumn ((current.indent + 1) * 4)
+                        , expectation = childExpectation
+                        , seed = current.seed
+                        }
 
-                created : { desc : Description, seed : Seed }
-                created =
-                    create newSeed child
+                ( newId, newSeed ) =
+                    Id.step new.seed
             in
-            { desc =
+            { pos = new.pos
+            , desc =
                 DescribeBlock
                     { name = name
-                    , id = blockId
+                    , id = newId
                     , found =
-                        created.desc
+                        Found
+                            { start = current.base
+                            , end = new.pos
+                            }
+                            new.desc
+                    , expected = current.expectation
                     }
             , seed = newSeed
             }
 
-        NewRecord name fields ->
+        ExpectRecord name fields ->
             let
-                ( blockId, newSeed ) =
-                    Id.step seed
-
-                created =
+                new =
                     List.foldl
-                        createField
-                        { fields = []
-                        , seed = newSeed
+                        (createField (current.indent + 1))
+                        { position = moveNewline current.base
+                        , fields = []
+                        , seed = current.seed
                         }
                         fields
+
+                ( newId, newSeed ) =
+                    Id.step new.seed
             in
-            { desc =
+            { pos = new.position
+            , desc =
                 Record
                     { name = name
-                    , id = blockId
+                    , id = newId
                     , found =
-                        created.fields
+                        Found
+                            { start = current.base
+                            , end = moveNewline new.position
+                            }
+                            new.fields
+                    , expected = current.expectation
                     }
-            , seed = created.seed
+            , seed = newSeed
             }
 
-        NewItem icon children ->
+        ExpectTree content branches ->
             let
-                ( parentId, startSeed ) =
-                    Id.step seed
+                range =
+                    { start = current.base
+                    , end = lastPos
+                    }
 
-                childSeed : Seed
-                childSeed =
-                    Id.indent startSeed
+                ( parentId, newSeed ) =
+                    Id.step current.seed
 
-                ( finalSeed, childrenDescriptions ) =
+                ( finalSeed, lastPos, children ) =
                     List.foldl
-                        (\item ( currentSeed, result ) ->
+                        (\branch ( seed, newBase, result ) ->
                             let
-                                created : { desc : Description, seed : Seed }
-                                created =
-                                    create currentSeed item
+                                new =
+                                    createTree
+                                        branch
+                                        { indent = current.indent
+                                        , base = newBase
+                                        , seed = seed
+                                        }
                             in
-                            ( created.seed
-                            , created.desc
+                            ( new.seed
+                            , new.pos
+                                |> moveNewline
+                                |> moveNewline
+                                |> moveColumn (current.indent * 4)
+                            , new.desc
                                 :: result
                             )
                         )
-                        ( childSeed, [] )
-                        children
+                        ( newSeed, current.base, [] )
+                        branches
+                        |> (\( s, p, c ) -> ( s, p, List.reverse c ))
             in
-            { desc =
-                DescribeItem
-                    { id = parentId
-                    , icon = icon
-                    , content = []
-                    , children =
-                        childrenDescriptions
-                    }
-            , seed = finalSeed
-            }
-
-        NewGroup items ->
-            let
-                ( parentId, startSeed ) =
-                    Id.step seed
-
-                childSeed : Seed
-                childSeed =
-                    Id.indent startSeed
-
-                ( finalSeed, children ) =
-                    List.foldl
-                        (\item ( currentSeed, result ) ->
-                            let
-                                created : { desc : Description, seed : Seed }
-                                created =
-                                    create currentSeed item
-                            in
-                            ( created.seed
-                            , created.desc
-                                :: result
-                            )
-                        )
-                        ( childSeed, [] )
-                        items
-            in
-            { seed = finalSeed
+            { pos = moveNewline current.base
             , desc =
-                Group
-                    { id = parentId
-                    , children = List.reverse children
+                DescribeTree
+                    { children = children
+                    , id = parentId
+                    , range = range
+                    , expected = current.expectation
                     }
+            , seed = newSeed
             }
 
-        NewStartsWith one two ->
+        ExpectOneOf choices ->
+            let
+                ( newId, newSeed ) =
+                    Id.step current.seed
+
+                -- QUESTION: what about an empty OneOf
+                new =
+                    create
+                        { indent = current.indent + 1
+                        , base = current.base
+                        , expectation =
+                            Maybe.withDefault
+                                ExpectNothing
+                                (List.head choices)
+                        , seed = newSeed
+                        }
+            in
+            { pos = new.pos
+            , desc =
+                OneOf
+                    { id = newId
+                    , choices = choices
+                    , child =
+                        Found
+                            { start = current.base
+                            , end = new.pos
+                            }
+                            new.desc
+                    }
+            , seed = new.seed
+            }
+
+        ExpectManyOf choices ->
             let
                 ( parentId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
 
-                first : { desc : Description, seed : Seed }
-                first =
-                    create newSeed one
+                ( _, childStart ) =
+                    Id.step newSeed
 
-                second : { desc : Description, seed : Seed }
-                second =
-                    create first.seed two
+                reseeded =
+                    Id.reseed childStart
+
+                ( finalSeed, lastPos, children ) =
+                    List.foldl
+                        (\choice ( seed, newBase, result ) ->
+                            let
+                                new =
+                                    create
+                                        { indent = current.indent
+                                        , base = newBase
+                                        , expectation = choice
+                                        , seed = seed
+                                        }
+                            in
+                            ( new.seed
+                            , new.pos
+                                |> moveNewline
+                                |> moveNewline
+                                |> moveColumn (current.indent * 4)
+                            , Found
+                                { start = newBase
+                                , end = new.pos
+                                }
+                                new.desc
+                                :: result
+                            )
+                        )
+                        ( newSeed, current.base, [] )
+                        choices
+                        |> (\( s, p, c ) -> ( s, p, List.reverse c ))
             in
-            { desc =
+            { pos = moveNewline lastPos
+            , seed = finalSeed
+            , desc =
+                ManyOf
+                    { id = parentId
+                    , range =
+                        { start = current.base
+                        , end = lastPos
+                        }
+                    , choices = choices
+                    , children = children
+                    }
+            }
+
+        ExpectStartsWith start remaining ->
+            let
+                ( parentId, newSeed ) =
+                    Id.step current.seed
+
+                first =
+                    create
+                        { indent = current.indent
+                        , base = current.base
+                        , expectation = start
+                        , seed = newSeed
+                        }
+
+                second =
+                    create
+                        { indent = current.indent
+                        , base = moveNewline first.pos
+                        , expectation = remaining
+                        , seed = first.seed
+                        }
+            in
+            { pos = second.pos
+            , desc =
                 StartsWith
                     { id = parentId
-                    , first = first.desc
-                    , second = second.desc
+                    , range =
+                        { start = current.base
+                        , end = second.pos
+                        }
+                    , first =
+                        { found = first.desc
+                        , expected = start
+                        }
+                    , second =
+                        { found = second.desc
+                        , expected = remaining
+                        }
                     }
             , seed = second.seed
             }
 
         -- Primitives
-        NewBoolean b ->
+        ExpectBoolean b ->
             let
+                boolString =
+                    boolToString b
+
+                end =
+                    moveColumn (String.length boolString) current.base
+
+                range =
+                    { start = current.base
+                    , end = end
+                    }
+
                 ( newId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
             in
-            { desc =
+            { pos = end
+            , desc =
                 DescribeBoolean
                     { id = newId
                     , found =
-                        b
+                        Found range b
                     }
             , seed = newSeed
             }
 
-        NewInteger i ->
+        ExpectInteger i ->
             let
+                end =
+                    moveColumn
+                        (String.length (String.fromInt i))
+                        current.base
+
+                pos =
+                    { start = current.base
+                    , end = end
+                    }
+
                 ( newId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
             in
-            { desc =
+            { pos = end
+            , desc =
                 DescribeInteger
                     { id = newId
-                    , found = i
+                    , found = Found pos i
                     }
             , seed = newSeed
             }
 
-        NewFloat f ->
+        ExpectFloat f ->
             let
+                end =
+                    moveColumn
+                        (String.length (String.fromFloat f))
+                        current.base
+
+                pos =
+                    { start = current.base
+                    , end = end
+                    }
+
                 ( newId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
             in
-            { desc =
+            { pos = end
+            , desc =
                 DescribeFloat
                     { id = newId
-                    , found = ( String.fromFloat f, f )
+                    , found = Found pos ( String.fromFloat f, f )
                     }
             , seed = newSeed
             }
 
-        NewString str ->
+        ExpectString str ->
             let
+                end =
+                    moveColumn (String.length str) current.base
+
+                walk line ( isStart, at ) =
+                    at
+                        |> (if isStart then
+                                identity
+
+                            else
+                                moveColumn ((current.indent + 1) * 4)
+                           )
+                        |> moveColumn (String.length line)
+                        |> moveNewline
+                        |> Tuple.pair False
+
+                lineDiff =
+                    str
+                        |> String.lines
+                        |> List.foldl walk ( True, current.base )
+                        |> Tuple.second
+
+                pos =
+                    { start = current.base
+                    , end = end
+                    }
+
                 ( newId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
             in
-            { desc = DescribeString newId str
+            { pos = end
+            , desc = DescribeString newId pos str
             , seed = newSeed
             }
 
-        NewTextBlock nodes ->
+        ExpectTextBlock nodes ->
             let
-                newText : List TextDescription
-                newText =
-                    createInline nodes
+                ( end, newText ) =
+                    createInline current.base nodes
 
                 ( newId, newSeed ) =
-                    Id.step seed
+                    Id.step current.seed
             in
-            { desc =
+            { pos = end
+            , desc =
                 DescribeText
                     { id = newId
+                    , range =
+                        { start = current.base
+                        , end = end
+                        }
                     , text = newText
                     }
             , seed = newSeed
             }
 
+        ExpectNothing ->
+            let
+                ( newId, newSeed ) =
+                    Id.step current.seed
+            in
+            { pos = current.base
+            , desc = DescribeNothing newId
+            , seed = newSeed
+            }
+
+
+createTree :
+    TreeExpectation
+    ->
+        { seed : Id.Seed
+        , indent : Int
+        , base : Position
+        }
+    ->
+        { pos : Position
+        , desc : Nested Description
+        , seed : Id.Seed
+        }
+createTree (TreeExpectation details) cursor =
+    let
+        -- create content first
+        ( contentSeed, contentLastPos, content ) =
+            List.foldl
+                (\choice ( seed, newBase, result ) ->
+                    let
+                        new =
+                            create
+                                { indent = cursor.indent
+                                , base = newBase
+                                , expectation = choice
+                                , seed = seed
+                                }
+                    in
+                    ( new.seed
+                    , new.pos
+                        |> moveNewline
+                        |> moveNewline
+                        |> moveColumn (cursor.indent * 4)
+                    , new.desc :: result
+                    )
+                )
+                ( cursor.seed, cursor.base, [] )
+                details.content
+                |> (\( s, p, c ) -> ( s, p, List.reverse c ))
+
+        -- Then create children
+        ( finalSeed, lastPos, children ) =
+            List.foldl
+                (\branch ( seed, newBase, result ) ->
+                    let
+                        new =
+                            createTree
+                                branch
+                                { indent = cursor.indent
+                                , base = newBase
+                                , seed = seed
+                                }
+                    in
+                    ( new.seed
+                    , new.pos
+                        |> moveNewline
+                        |> moveNewline
+                        |> moveColumn (cursor.indent * 4)
+                    , new.desc :: result
+                    )
+                )
+                ( contentSeed, contentLastPos, [] )
+                details.children
+                |> (\( s, p, c ) -> ( s, p, List.reverse c ))
+    in
+    { desc =
+        Nested
+            { icon = details.icon
+            , content = content
+            , children =
+                children
+            }
+    , pos = lastPos
+    , seed = finalSeed
+    }
+
 
 type alias CreateFieldCursor =
-    { fields : List ( String, Description )
+    { position : Position
+
+    -- We've already created these
+    , fields : List ( String, Found Description )
     , seed : Id.Seed
     }
 
 
 {-| -}
 createField :
-    ( String, New )
+    Int
+    -> ( String, Expectation )
     -> CreateFieldCursor
     -> CreateFieldCursor
-createField ( name, new ) current =
+createField currentIndent ( name, exp ) current =
     let
-        created : { desc : Description, seed : Seed }
-        created =
-            create current.seed new
+        -- This is the beginning of the field
+        --    field = x
+        --   ^ right there
+        fieldValueStart =
+            current.position
+                |> moveColumn (currentIndent * 4)
+
+        -- If the field value is more than a line
+        new =
+            create
+                { indent = currentIndent + 1
+                , base =
+                    fieldValueStart
+                        -- Add a few characters to account for `field = `.
+                        |> moveColumn (String.length name + 3)
+                , expectation = exp
+                , seed = current.seed
+                }
+
+        height =
+            new.pos.line - current.position.line
+
+        fieldEnd =
+            moveNewline new.pos
     in
-    { fields =
-        ( name
-        , created.desc
-        )
-            :: current.fields
-    , seed = created.seed
-    }
+    if height == 0 then
+        { position = fieldEnd
+        , fields =
+            ( name
+            , Found
+                { start =
+                    fieldValueStart
+                , end =
+                    fieldEnd
+                }
+                new.desc
+            )
+                :: current.fields
+        , seed = new.seed
+        }
+
+    else
+        let
+            -- If the field value is more than a line
+            multiline =
+                create
+                    { indent = currentIndent + 1
+                    , base =
+                        fieldValueStart
+                            -- account for just `fieldname =`
+                            |> moveColumn (String.length name + 2)
+                            |> moveNewline
+                            -- Indent one level further
+                            |> moveColumn ((currentIndent + 1) * 4)
+                    , expectation = exp
+                    , seed = current.seed
+                    }
+
+            finalEnd =
+                multiline.pos
+                    |> moveNewline
+        in
+        { position = finalEnd
+        , fields =
+            ( name
+            , Found
+                { start =
+                    fieldValueStart
+                , end =
+                    finalEnd
+                }
+                multiline.desc
+            )
+                :: current.fields
+        , seed = multiline.seed
+        }
 
 
 {-| -}
@@ -2160,361 +2075,79 @@ errorsToList ( fst, remain ) =
 
 {-| -}
 compile :
-    Document meta data
+    Document data
     -> String
     ->
         Result
             (Outcome (List Error.Rendered)
                 { errors : List Error.Rendered
-                , result : ( meta, List data )
+                , result : data
                 }
-                ( meta, List data )
+                data
             )
             ( Parsed
             , Outcome (List Error.Rendered)
                 { errors : List Error.Rendered
-                , result : ( meta, List data )
+                , result : data
                 }
-                ( meta, List data )
+                data
             )
 compile (Document blocks) source =
     case Parser.run blocks.parser source of
         Ok ((Parsed parsedDetails) as parsed) ->
-            case parsedDetails.errors of
-                [] ->
-                    case blocks.converter parsed of
-                        Success rendered ->
-                            Ok
-                                ( Parsed { parsedDetails | attributes = rendered.attrs }
-                                , Success rendered.data
-                                )
+            (Ok << Tuple.pair parsed) <|
+                case parsedDetails.errors of
+                    [] ->
+                        case blocks.converter parsed of
+                            Success rendered ->
+                                Success rendered
 
-                        Almost (Recovered errors rendered) ->
-                            Ok
-                                ( Parsed { parsedDetails | attributes = rendered.attrs }
-                                , Almost
+                            Almost (Recovered errors rendered) ->
+                                Almost
                                     { errors = List.map (Error.render source) (errorsToList errors)
-                                    , result = rendered.data
+                                    , result = rendered
                                     }
-                                )
 
-                        Almost (Uncertain errors) ->
-                            -- now we're certain :/
-                            Ok ( parsed, Failure (List.map (Error.render source) (errorsToList errors)) )
+                            Almost (Uncertain errors) ->
+                                -- now we're certain :/
+                                Failure (List.map (Error.render source) (errorsToList errors))
 
-                        Failure Error.NoMatch ->
-                            -- Invalid Ast.
-                            -- This should never happen because
-                            -- we definitely have the same document in both parsing and converting.
-                            Ok
-                                ( parsed
-                                , Failure
+                            Failure Error.NoMatch ->
+                                -- Invalid Ast.
+                                -- This should never happen because
+                                -- we definitely have the same document in both parsing and converting.
+                                Failure
                                     [ Error.documentMismatch ]
-                                )
 
-                _ ->
-                    case blocks.converter parsed of
-                        Success rendered ->
-                            Ok
-                                ( Parsed { parsedDetails | attributes = rendered.attrs }
-                                , Almost
+                    _ ->
+                        case blocks.converter parsed of
+                            Success rendered ->
+                                Almost
                                     { errors = parsedDetails.errors
-                                    , result = rendered.data
+                                    , result = rendered
                                     }
-                                )
 
-                        Almost (Uncertain ( err, remainError )) ->
-                            Ok
-                                ( parsed
-                                , Failure (List.map (Error.render source) (err :: remainError))
-                                )
+                            Almost (Uncertain ( err, remainError )) ->
+                                Failure (List.map (Error.render source) (err :: remainError))
 
-                        Almost (Recovered ( err, remainError ) rendered) ->
-                            Ok
-                                ( Parsed { parsedDetails | attributes = rendered.attrs }
-                                , Almost
+                            Almost (Recovered ( err, remainError ) result) ->
+                                Almost
                                     { errors =
                                         List.map (Error.render source) (err :: remainError)
-                                    , result = rendered.data
+                                    , result = result
                                     }
-                                )
 
-                        Failure noMatch ->
-                            Ok
-                                ( parsed
-                                , Failure
+                            Failure noMatch ->
+                                Failure
                                     (Error.documentMismatch
                                         :: parsedDetails.errors
                                     )
-                                )
 
         Err deadEnds ->
             Err <|
                 Failure
                     [ Error.renderParsingErrors source deadEnds
                     ]
-
-
-{-| In order for block lookups to work and for the block to be renderable, we need to retrieve a block, but keep the general structure.
-
-So, if we have `ManyOf [ One,Two ]`, and our ID matches `Two`, we need to return `ManyOf [Two]`, not just `Two`.
-
-Then our rendering function will still work.
-
--}
-lookup : Id.Id -> Document meta block -> Parsed -> Outcome (List Error.Rendered) (Partial block) block
-lookup id (Document doc) (Parsed parsed) =
-    case find id parsed.found of
-        Nothing ->
-            Failure [ Error.compilerError ]
-
-        Just found ->
-            case doc.converter (Parsed { parsed | found = found }) of
-                Success rendered ->
-                    case rendered.data of
-                        ( _, top :: _ ) ->
-                            Success top
-
-                        _ ->
-                            Failure [ Error.compilerError ]
-
-                Almost (Uncertain ( err, remainError )) ->
-                    -- Failure (List.map (Error.render source) (err :: remainError))
-                    Failure [ Error.compilerError ]
-
-                Almost (Recovered ( err, remainError ) result) ->
-                    -- Almost
-                    --     { errors = List.map (Error.render source) (err :: remainError)
-                    --     , result = result
-                    --     }
-                    Failure [ Error.compilerError ]
-
-                Failure noMatch ->
-                    Failure [ Error.compilerError ]
-
-
-firstFound : Id.Id -> List Description -> Maybe Description
-firstFound id options =
-    case options of
-        [] ->
-            Nothing
-
-        top :: remain ->
-            case find id top of
-                Nothing ->
-                    firstFound id remain
-
-                found ->
-                    found
-
-
-find : Id.Id -> Description -> Maybe Description
-find targetId desc =
-    case desc of
-        DescribeUnexpected id details ->
-            if id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        DescribeBlock details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        Record details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        Group details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                case firstFound targetId details.children of
-                    Nothing ->
-                        Nothing
-
-                    Just block ->
-                        Just
-                            (Group
-                                { details
-                                    | children = [ block ]
-                                }
-                            )
-
-        StartsWith details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                case find targetId details.first of
-                    Nothing ->
-                        find targetId details.second
-
-                    found ->
-                        found
-
-        DescribeItem details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                case firstFound targetId details.content of
-                    Nothing ->
-                        case firstFound targetId details.children of
-                            Nothing ->
-                                Nothing
-
-                            Just block ->
-                                Just
-                                    (DescribeItem
-                                        { details
-                                            | children = [ block ]
-                                        }
-                                    )
-
-                    Just block ->
-                        Just
-                            (DescribeItem
-                                { details
-                                    | children = [ block ]
-                                }
-                            )
-
-        -- Primitives
-        DescribeBoolean details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        DescribeInteger details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        DescribeFloat details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        DescribeText details ->
-            if details.id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-        DescribeString id string ->
-            if id == targetId then
-                Just desc
-
-            else
-                Nothing
-
-
-{-| Subtle destinction between this and `find`.
-
-This will NOT reconstruct the full hierarchy, but return the exact blocks asked for.
-
-This also won't verify that all ids in the document were found, it'll just return the stuff it finds.
-
--}
-findMany : List Id.Id -> Description -> List Description
-findMany ids desc =
-    findManyHelper ids desc []
-
-
-findManyHelper ids desc found =
-    case desc of
-        DescribeUnexpected id details ->
-            if List.member id ids then
-                desc :: found
-
-            else
-                found
-
-        DescribeBlock details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        Record details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        Group details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                List.foldl (findManyHelper ids) found details.children
-
-        StartsWith details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                findManyHelper ids details.first found
-                    |> findManyHelper ids details.second
-
-        DescribeItem details ->
-            case List.foldl (findManyHelper ids) found details.content of
-                foundContent ->
-                    List.foldl (findManyHelper ids) foundContent details.children
-
-        -- Primitives
-        DescribeBoolean details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        DescribeInteger details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        DescribeFloat details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        DescribeText details ->
-            if List.member details.id ids then
-                desc :: found
-
-            else
-                found
-
-        DescribeString id string ->
-            if List.member id ids then
-                desc :: found
-
-            else
-                found
 
 
 {-| Render is a little odd.
@@ -2525,15 +2158,15 @@ Render can't add additional errors.
 
 -}
 render :
-    Document meta data
+    Document data
     -> Parsed
-    -> Outcome (List Error.Rendered) { errors : List Error.Rendered, result : ( meta, List data ) } ( meta, List data )
+    -> Outcome (List Error.Rendered) { errors : List Error.Rendered, result : data } data
 render (Document blocks) ((Parsed parsedDetails) as parsed) =
     case parsedDetails.errors of
         [] ->
             case blocks.converter parsed of
                 Success rendered ->
-                    Success rendered.data
+                    Success rendered
 
                 Almost (Uncertain ( err, remainError )) ->
                     -- Failure (List.map (Error.render source) (err :: remainError))
@@ -2554,7 +2187,7 @@ render (Document blocks) ((Parsed parsedDetails) as parsed) =
                 Success rendered ->
                     Almost
                         { errors = parsedDetails.errors
-                        , result = rendered.data
+                        , result = rendered
                         }
 
                 Almost (Uncertain _) ->
@@ -2563,7 +2196,7 @@ render (Document blocks) ((Parsed parsedDetails) as parsed) =
                 Almost (Recovered _ result) ->
                     Almost
                         { errors = parsedDetails.errors
-                        , result = result.data
+                        , result = result
                         }
 
                 Failure noMatch ->
@@ -2575,6 +2208,9 @@ render (Document blocks) ((Parsed parsedDetails) as parsed) =
 
 humanReadableExpectations expect =
     case expect of
+        ExpectNothing ->
+            ""
+
         ExpectBlock name exp ->
             "|> " ++ name
 
@@ -2605,169 +2241,45 @@ humanReadableExpectations expect =
         ExpectString _ ->
             "A String"
 
-        ExpectTree _ ->
-            "A tree"
+        ExpectTree content _ ->
+            "A tree starting of "
+                ++ humanReadableExpectations content
+                ++ " content"
 
 
 mergeWith fn one two =
-    case one of
-        Success renderedOne ->
-            case two of
-                Success renderedTwo ->
-                    Success (fn renderedOne renderedTwo)
+    case ( one, two ) of
+        ( Success renderedOne, Success renderedTwo ) ->
+            Success (fn renderedOne renderedTwo)
 
-                Almost (Recovered errors second) ->
-                    Almost
-                        (Recovered
-                            errors
-                            (fn renderedOne second)
-                        )
+        ( Almost (Recovered firstErrs fst), Almost (Recovered secondErrs snd) ) ->
+            Almost
+                (Recovered
+                    (mergeErrors firstErrs secondErrs)
+                    (fn fst snd)
+                )
 
-                _ ->
-                    Failure Error.NoMatch
+        ( Almost (Uncertain unexpected), _ ) ->
+            Almost (Uncertain unexpected)
 
-        Almost (Recovered firstErrs fst) ->
-            case two of
-                Almost (Recovered secondErrs snd) ->
-                    Almost
-                        (Recovered
-                            (mergeErrors firstErrs secondErrs)
-                            (fn fst snd)
-                        )
-
-                _ ->
-                    Failure Error.NoMatch
-
-        Almost (Uncertain unexpected) ->
+        ( _, Almost (Uncertain unexpected) ) ->
             Almost (Uncertain unexpected)
 
         _ ->
-            case two of
-                Almost (Uncertain unexpected) ->
-                    Almost (Uncertain unexpected)
-
-                _ ->
-                    Failure Error.NoMatch
-
-
-mergeWithAttrs : (one -> two -> final) -> BlockOutcome one -> BlockOutcome two -> BlockOutcome final
-mergeWithAttrs fn one two =
-    case one of
-        Success first ->
-            case two of
-                Success second ->
-                    Success
-                        { data = fn first.data second.data
-                        , attrs = first.attrs ++ second.attrs
-                        }
-
-                Almost (Recovered errors second) ->
-                    Almost
-                        (Recovered
-                            errors
-                            { data = fn first.data second.data
-                            , attrs = first.attrs ++ second.attrs
-                            }
-                        )
-
-                Almost (Uncertain unexpected) ->
-                    Almost (Uncertain unexpected)
-
-                Failure err ->
-                    Failure err
-
-        Almost (Recovered firstErrs first) ->
-            case two of
-                Success second ->
-                    Almost
-                        (Recovered firstErrs
-                            { data = fn first.data second.data
-                            , attrs = first.attrs ++ second.attrs
-                            }
-                        )
-
-                Almost (Recovered secondErrs second) ->
-                    Almost
-                        (Recovered
-                            (mergeErrors firstErrs secondErrs)
-                            { data = fn first.data second.data
-                            , attrs = first.attrs ++ second.attrs
-                            }
-                        )
-
-                Almost (Uncertain unexpected) ->
-                    Almost (Uncertain unexpected)
-
-                Failure twoErr ->
-                    Failure twoErr
-
-        Almost (Uncertain unexpected) ->
-            Almost (Uncertain unexpected)
-
-        Failure err ->
-            Failure err
-
-
-type alias ListOutcome data =
-    Outcome Error.AstError (Uncertain (List (WithAttr data))) (List (WithAttr data))
-
-
-mergeListWithAttrs : (List one -> List two -> final) -> ListOutcome one -> ListOutcome two -> BlockOutcome final
-mergeListWithAttrs fn one two =
-    case one of
-        Success first ->
-            case two of
-                Success second ->
-                    Success
-                        { data = fn (List.map .data first) (List.map .data second)
-                        , attrs = List.concatMap .attrs first ++ List.concatMap .attrs second
-                        }
-
-                Almost (Recovered errors second) ->
-                    Almost
-                        (Recovered
-                            errors
-                            { data = fn (List.map .data first) (List.map .data second)
-                            , attrs = List.concatMap .attrs first ++ List.concatMap .attrs second
-                            }
-                        )
-
-                _ ->
-                    Failure Error.NoMatch
-
-        Almost (Recovered firstErrs first) ->
-            case two of
-                Success second ->
-                    Almost
-                        (Recovered firstErrs
-                            { data = fn (List.map .data first) (List.map .data second)
-                            , attrs = List.concatMap .attrs first ++ List.concatMap .attrs second
-                            }
-                        )
-
-                Almost (Recovered secondErrs second) ->
-                    Almost
-                        (Recovered
-                            (mergeErrors firstErrs secondErrs)
-                            { data = fn (List.map .data first) (List.map .data second)
-                            , attrs = List.concatMap .attrs first ++ List.concatMap .attrs second
-                            }
-                        )
-
-                _ ->
-                    Failure Error.NoMatch
-
-        Almost (Uncertain unexpected) ->
-            Almost (Uncertain unexpected)
-
-        _ ->
-            case two of
-                Almost (Uncertain unexpected) ->
-                    Almost (Uncertain unexpected)
-
-                _ ->
-                    Failure Error.NoMatch
+            Failure Error.NoMatch
 
 
 mergeErrors ( h1, r1 ) ( h2, r2 ) =
     ( h1, r1 ++ h2 :: r2 )
+
+
+resultToFound result =
+    case result of
+        Ok ( range, desc ) ->
+            Found range desc
+
+        Err ( range, prob ) ->
+            Unexpected
+                { range = range
+                , problem = prob
+                }

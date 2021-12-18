@@ -1,10 +1,9 @@
 module Mark.Internal.Id exposing
     ( Id(..)
     , Seed
-    , dedent
     , fromString
-    , indent
     , initialSeed
+    , reseed
     , step
     , thread
     , threadThrough
@@ -14,18 +13,18 @@ module Mark.Internal.Id exposing
 {-| -}
 
 
-initialSeed : String -> Seed
-initialSeed doc =
-    Seed doc [ 0 ]
+initialSeed : Seed
+initialSeed =
+    Seed [ 0 ]
 
 
 {-| We might want to move to a list based ID.
 
-So, when we `indent`, we're actually adding a level.
+So, when we `reseed`, we're actually adding a level.
 
     Seed [0]
 
-    Seed [1] --indent -> Seed [1, 0]
+    Seed [1] --reseed -> Seed [1, 0]
                             |
                             v
                          Seed [1, 1]
@@ -35,42 +34,27 @@ So, when we `indent`, we're actually adding a level.
 
 Is there a performance issue with allocating a bunch of lists intead of base Ints?
 
-A very common pattern is to
-
-    1. step a seed forward and pass that seed for the next block
-    2. indent the same original seed, and pass that to the children
-
-So
-
-    [0]
-        -> stepped [1]  (goes to next element by handing the seed back in the parser)
-        -> indented [0,0] (handed to child parser to go nuts with)
-
 -}
 type Seed
-    = Seed String (List Int)
+    = Seed (List Int)
 
 
-type Id
-    = Id String (List Int)
-
-
-toString (Id str ids) =
+toString (Id ids) =
     ids
         |> List.map String.fromInt
-        |> String.join "."
-        |> (\x -> "m." ++ str ++ "." ++ x)
+        |> String.join "-"
+        |> (\x -> "m-" ++ x)
 
 
 fromString str =
-    case String.split "." str of
-        "m" :: docId :: remain ->
+    case String.split "-" str of
+        "m" :: remain ->
             let
                 parsed =
                     List.filterMap String.toInt remain
             in
             if List.length parsed == List.length remain then
-                Just (Id docId parsed)
+                Just (Id parsed)
 
             else
                 Nothing
@@ -80,25 +64,19 @@ fromString str =
 
 
 {-| -}
-indent : Seed -> Seed
-indent (Seed doc seed) =
-    Seed doc (0 :: seed)
-
-
-{-| -}
-dedent : Int -> Seed -> Seed
-dedent num (Seed doc seed) =
-    Seed doc (List.drop num seed)
+reseed : Seed -> Seed
+reseed (Seed seed) =
+    Seed (0 :: seed)
 
 
 step : Seed -> ( Id, Seed )
-step (Seed doc seed) =
+step (Seed seed) =
     case seed of
         [] ->
-            ( Id doc [ 0 ], Seed doc [ 0 ] )
+            ( Id [ 0 ], Seed [ 0 ] )
 
         current :: remain ->
-            ( Id doc seed, Seed doc (current + 1 :: remain) )
+            ( Id seed, Seed (current + 1 :: remain) )
 
 
 thread : Seed -> List (Seed -> ( Seed, thing )) -> ( Seed, List thing )
@@ -113,3 +91,7 @@ threadThrough current ( seed, past ) =
             current seed
     in
     ( newSeed, result :: past )
+
+
+type Id
+    = Id (List Int)
